@@ -72,7 +72,7 @@ windows/   WinUI3 / C#        — Mica, via le shim FFI (P/Invoke)
 
 Chaque frontend suit nativement le mode clair/sombre de son OS, et utilise les vrais widgets/dialogues système (sélecteur de fichiers, notifications, "À propos"...).
 
-**État de test** : macOS et Linux sont buildés et testés réellement (macOS nativement, Linux via le backend macOS de GTK4 — le rendu visuel diffère d'un vrai bureau GNOME mais le code et les widgets Adwaita sont réels). **Windows/WinUI3 est écrit par analogie mais n'a jamais été compilé ni lancé** faute de machine Windows — contributions bienvenues pour le vérifier/corriger.
+**État de test** : macOS et Linux sont buildés et testés réellement (macOS nativement, Linux via le backend macOS de GTK4 — le rendu visuel diffère d'un vrai bureau GNOME mais le code et les widgets Adwaita sont réels). **Windows/WinUI3 est écrit par analogie et n'a jamais été lancé** faute de machine Windows : le job CI `build-windows` le compile (Rust + app WinUI3), mais rien n'y est testé à l'exécution — contributions bienvenues pour le vérifier/corriger.
 
 **Icône de tray Linux non implémentée** : GNOME n'a pas de support natif pour les icônes de tray (StatusNotifierItem) sans extension. Une intégration via `ksni` (le protocole D-Bus StatusNotifierItem) reste à faire et à tester sur une vraie machine Linux.
 

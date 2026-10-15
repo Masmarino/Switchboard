@@ -29,6 +29,8 @@ jobs:
 
   build-macos-app:
     runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "26.0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -37,3 +39,23 @@ jobs:
       - run: cargo build -p switchboard-ffi --release
       - working-directory: macos
         run: swift build -c release
+
+  # Rien n'est teste sous Windows (les tests lancent des commandes sh) : on verifie au moins
+  # que le Rust et l'app WinUI3 compilent.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo clippy (core, ffi, cli)
+        run: cargo clippy -p switchboard-core -p switchboard-ffi -p switchboard-cli --all-targets -- -D warnings
+      - name: Build FFI (release)
+        run: cargo build -p switchboard-ffi --release
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build WinUI3 app
+        working-directory: windows
+        run: dotnet build Switchboard.csproj -c Release -r win-x64 -p:WindowsPackageType=None

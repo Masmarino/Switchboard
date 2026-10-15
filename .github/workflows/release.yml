@@ -13,6 +13,7 @@ jobs:
     runs-on: macos-26
     env:
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+      MACOSX_DEPLOYMENT_TARGET: "26.0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -49,7 +50,7 @@ jobs:
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${{ env.VERSION }}</string>
             <key>CFBundleVersion</key><string>${{ env.VERSION }}</string>
-            <key>LSMinimumSystemVersion</key><string>15.0</string>
+            <key>LSMinimumSystemVersion</key><string>26.0</string>
           </dict>
           </plist>
           EOF
@@ -104,6 +105,16 @@ jobs:
         with:
           name: switchboard-macos
           path: Switchboard-${{ env.VERSION }}-macos.dmg
+      - name: Notarize CLI
+        if: ${{ env.HAS_APPLE_CERT == 'true' }}
+        run: |
+          # Un binaire nu ne peut pas etre agrafe : Gatekeeper verifie le ticket en ligne.
+          ditto -c -k target/release/switchboard-cli switchboard-cli-notarize.zip
+          xcrun notarytool submit switchboard-cli-notarize.zip \
+            --apple-id "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" \
+            --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+            --wait
       - name: Package CLI
         run: tar -czf "switchboard-cli-${{ env.VERSION }}-macos-arm64.tar.gz" -C target/release switchboard-cli
       - uses: actions/upload-artifact@v7
@@ -140,6 +151,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out
           Copy-Item "$($publishDir.FullName)\*" $out -Recurse
           Copy-Item "target\release\switchboard_ffi.dll" $out
+          Copy-Item "target\release\switchboard-cli.exe" $out
           Copy-Item "icons\icon.ico" $out
           Compress-Archive -Path "$out\*" -DestinationPath "switchboard-${{ env.VERSION }}-windows.zip"
       - uses: actions/upload-artifact@v7

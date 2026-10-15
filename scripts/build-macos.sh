@@ -3,6 +3,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Meme minimum que Package.swift : sinon le code C de ring est compile pour la version du
+# SDK installe et ld previent que les objets visent un macOS plus recent que l'app.
+export MACOSX_DEPLOYMENT_TARGET=26.0
+
 cargo build -p switchboard-ffi --release
 
 pushd macos >/dev/null
