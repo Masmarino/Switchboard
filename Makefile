@@ -1,4 +1,4 @@
-.PHONY: macos linux windows test
+.PHONY: macos linux windows cli test
 
 macos:
 	./scripts/build-macos.sh
@@ -9,5 +9,8 @@ linux:
 windows:
 	@echo "Sur Windows, lance scripts/build-windows.ps1 depuis PowerShell."
 
+cli:
+	cargo install --path cli --locked
+
 test:
-	cargo test -p switchboard-core -p switchboard-ffi -p switchboard-linux
+	cargo test -p switchboard-core -p switchboard-ffi -p switchboard-linux -p switchboard-cli

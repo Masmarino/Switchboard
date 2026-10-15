@@ -22,10 +22,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
       - name: cargo test (Linux, all crates)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p switchboard-core -p switchboard-ffi -p switchboard-linux
+        run: cargo test -p switchboard-core -p switchboard-ffi -p switchboard-linux -p switchboard-cli
       - name: cargo test (macOS, no GTK)
         if: matrix.os == 'macos-26'
-        run: cargo test -p switchboard-core -p switchboard-ffi
+        run: cargo test -p switchboard-core -p switchboard-ffi -p switchboard-cli
 
   build-macos-app:
     runs-on: macos-26

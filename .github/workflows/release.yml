@@ -25,8 +25,8 @@ jobs:
           fi
       - name: Select latest available Xcode (Package.swift needs Swift tools 6.0+)
         run: sudo xcode-select -s $(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-      - name: Build FFI (release)
-        run: cargo build -p switchboard-ffi --release
+      - name: Build FFI and CLI (release)
+        run: cargo build -p switchboard-ffi -p switchboard-cli --release
       - name: Build SwiftUI app
         working-directory: macos
         run: swift build -c release
@@ -71,7 +71,9 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed 's/"//g')
       - name: Code sign app bundle
         if: ${{ env.HAS_APPLE_CERT == 'true' }}
-        run: codesign --deep --force --options runtime --timestamp --sign "${{ secrets.APPLE_SIGNING_IDENTITY }}" Switchboard.app
+        run: |
+          codesign --deep --force --options runtime --timestamp --sign "${{ secrets.APPLE_SIGNING_IDENTITY }}" Switchboard.app
+          codesign --force --options runtime --timestamp --sign "${{ secrets.APPLE_SIGNING_IDENTITY }}" target/release/switchboard-cli
       - name: Create .dmg (drag-to-Applications layout)
         run: |
           brew install create-dmg
@@ -102,6 +104,12 @@ jobs:
         with:
           name: switchboard-macos
           path: Switchboard-${{ env.VERSION }}-macos.dmg
+      - name: Package CLI
+        run: tar -czf "switchboard-cli-${{ env.VERSION }}-macos-arm64.tar.gz" -C target/release switchboard-cli
+      - uses: actions/upload-artifact@v7
+        with:
+          name: switchboard-cli-macos
+          path: switchboard-cli-${{ env.VERSION }}-macos-arm64.tar.gz
 
   build-windows:
     runs-on: windows-latest
@@ -116,8 +124,8 @@ jobs:
           else
             echo "VERSION=0.0.0-dev" >> "$GITHUB_ENV"
           fi
-      - name: Build FFI (release)
-        run: cargo build -p switchboard-ffi --release
+      - name: Build FFI and CLI (release)
+        run: cargo build -p switchboard-ffi -p switchboard-cli --release
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
@@ -138,6 +146,13 @@ jobs:
         with:
           name: switchboard-windows
           path: switchboard-${{ env.VERSION }}-windows.zip
+      - name: Package CLI
+        shell: pwsh
+        run: Compress-Archive -Path "target\release\switchboard-cli.exe" -DestinationPath "switchboard-cli-${{ env.VERSION }}-windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: switchboard-cli-windows
+          path: switchboard-cli-${{ env.VERSION }}-windows-x64.zip
       - name: Download Visual C++ Redistributable
         shell: pwsh
         run: Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "windows\vc_redist.x64.exe"
@@ -165,12 +180,12 @@ jobs:
           fi
       - name: Install GTK4/libadwaita dev packages
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
-      - name: Build Linux frontend (release)
-        run: cargo build -p switchboard-linux --release
+      - name: Build Linux frontend and CLI (release)
+        run: cargo build -p switchboard-linux -p switchboard-cli --release
       - name: Stage tarball
         run: |
           mkdir -p switchboard-linux/bin
-          cp target/release/switchboard switchboard-linux/bin/
+          cp target/release/switchboard target/release/switchboard-cli switchboard-linux/bin/
           cp -r icons switchboard-linux/
           cp linux/com.skolln.switchboard.desktop linux/install.sh switchboard-linux/
           chmod +x switchboard-linux/install.sh
@@ -180,6 +195,12 @@ jobs:
         with:
           name: switchboard-linux
           path: switchboard-${{ env.VERSION }}-linux.tar.gz
+      - name: Package CLI
+        run: tar -czf "switchboard-cli-${{ env.VERSION }}-linux-x64.tar.gz" -C target/release switchboard-cli
+      - uses: actions/upload-artifact@v7
+        with:
+          name: switchboard-cli-linux
+          path: switchboard-cli-${{ env.VERSION }}-linux-x64.tar.gz
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -194,7 +215,7 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           cd artifacts
-          sha256sum switchboard-macos/*.dmg switchboard-windows/*.zip switchboard-windows-installer/*.exe switchboard-linux/*.tar.gz > checksums.txt
+          sha256sum switchboard-macos/*.dmg switchboard-windows/*.zip switchboard-windows-installer/*.exe switchboard-linux/*.tar.gz switchboard-cli-*/* > checksums.txt
           cat checksums.txt
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
@@ -204,4 +225,5 @@ jobs:
             artifacts/switchboard-windows/*.zip
             artifacts/switchboard-windows-installer/*.exe
             artifacts/switchboard-linux/*.tar.gz
+            artifacts/switchboard-cli-*/*
             artifacts/checksums.txt

@@ -25,6 +25,7 @@ Les builds pour macOS, Windows et Linux sont disponibles sur la page [Releases](
 - **Usage CPU/mémoire** par app, affiché en direct
 - **Ordre de démarrage** : "Tout démarrer" lance les apps par paliers, pour laisser une dépendance (ex: une API) démarrer avant ses dépendants
 - **Icône menu bar / tray** pour démarrer/arrêter sans rouvrir la fenêtre principale
+- **CLI pour scripts et agents IA** (`switchboard-cli`) : créer, modifier, supprimer et piloter les apps, sortie JSON stable — voir plus bas
 - Aucun compte, aucun cloud — la config reste en local
 
 ## Types d'app et commandes par défaut
@@ -39,6 +40,23 @@ Les builds pour macOS, Windows et Linux sont disponibles sur la page [Releases](
 | Go | `go run <commande>` | optionnel, défaut `.` |
 | Raw | `sh -c "<commande>"` | obligatoire |
 
+## CLI (`switchboard-cli`)
+
+Un CLI permet de gérer les apps de lancement sans ouvrir la fenêtre, pensé pour qu'une IA comme Claude Code puisse les créer, les modifier et les piloter : `--json` sur toutes les commandes, codes de sortie documentés, aucune question interactive, et `switchboard-cli schema` qui décrit les champs attendus.
+
+```sh
+make cli                                   # installe switchboard-cli dans ~/.cargo/bin
+switchboard-cli add --name "Alume API" --dir . --kind cargo --url http://localhost:3000/health
+switchboard-cli start "alume api" --wait healthy
+switchboard-cli logs "alume api" --tail 50
+switchboard-cli stop --all
+```
+
+- Le CLI modifie le même `apps.json` que les apps natives (verrou + écriture atomique) ; une fenêtre Switchboard ouverte recharge le fichier en moins d'une seconde.
+- Les commandes de process passent par le « superviseur » : la fenêtre Switchboard si elle est ouverte, sinon un daemon lancé en arrière-plan à la demande (`switchboard-cli daemon stop` pour l'arrêter). À l'ouverture de la fenêtre, le daemon lui passe la main et elle relance ses apps.
+
+Guide complet pour les agents (contrat JSON, codes d'erreur, recettes) : [docs/cli.md](docs/cli.md).
+
 ## Pourquoi pas un seul framework cross-platform ?
 
 Aucun moteur de rendu immédiat (egui, etc.) ne peut afficher le vrai flou/vibrancy du compositeur (Liquid Glass macOS, Mica Windows) ni de vrais widgets système. Switchboard est donc écrit dans la techno native de chaque OS, et ne partage que la logique métier via un cœur Rust commun :
@@ -46,6 +64,7 @@ Aucun moteur de rendu immédiat (egui, etc.) ne peut afficher le vrai flou/vibra
 ```
 core/      switchboard-core   — logique partagée (config, process, logs, santé) — pure Rust, aucune dépendance UI
 ffi/       switchboard-ffi    — shim C ABI (JSON) sur core, pour macOS/Windows
+cli/       switchboard-cli    — CLI (scripts, agents IA), dépend de core directement
 linux/     switchboard-linux  — GTK4 + libadwaita, dépend de core directement (Rust)
 macos/     SwiftUI            — NavigationSplitView + Liquid Glass, via le shim FFI
 windows/   WinUI3 / C#        — Mica, via le shim FFI (P/Invoke)
@@ -63,7 +82,8 @@ Chaque frontend suit nativement le mode clair/sombre de son OS, et utilise les v
 make macos      # build + installe dans /Applications
 make linux      # build + lance (necessite gtk4-dev / libadwaita-dev)
 make windows    # affiche l'instruction (lancer scripts/build-windows.ps1 depuis PowerShell)
-make test       # tests Rust (core, ffi, linux)
+make cli        # installe switchboard-cli (cargo install)
+make test       # tests Rust (core, ffi, linux, cli)
 ```
 
 ### Le pont FFI (macOS / Windows)
