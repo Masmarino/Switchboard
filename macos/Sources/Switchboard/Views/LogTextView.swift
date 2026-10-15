@@ -17,8 +17,14 @@ struct LogTextView: NSViewRepresentable {
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
+        // Light selection colors on the dark terminal background left the selected text unreadable.
+        textView.selectedTextAttributes = [
+            .backgroundColor: NSColor(red: 0.20, green: 0.36, blue: 0.62, alpha: 1),
+            .foregroundColor: NSColor.white,
+        ]
 
         let scrollView = NSScrollView()
+        scrollView.appearance = NSAppearance(named: .darkAqua)
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
