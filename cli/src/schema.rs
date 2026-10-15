@@ -59,7 +59,11 @@ fn fields() -> Value {
         },
         {
             "name": "command", "type": "string", "required": "depends on kind", "flag": "--command", "default": "",
-            "rules": ["required for npm and raw", "ignored for cargo"],
+            "rules": [
+                "required for npm and raw",
+                "ignored for cargo",
+                "split like a shell: '...' and \"...\" keep spaces; an unclosed quote is rejected (raw commands go to sh -c as is)",
+            ],
             "description": "Arguments appended to the kind's program; for raw, a full shell command.",
         },
         {

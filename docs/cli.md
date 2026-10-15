@@ -10,8 +10,9 @@ stable `--json` output, explicit exit codes, actionable error messages and never
 make cli                       # cargo install --path cli --locked → ~/.cargo/bin/switchboard-cli
 ```
 
-Release builds also ship `switchboard-cli-<version>-<os>-<arch>` archives (and the Linux tarball
-contains `bin/switchboard-cli`).
+Release builds also ship `switchboard-cli-<version>-<os>-<arch>` archives (signed and notarized on
+macOS when the signing secrets are set). The Linux tarball contains `bin/switchboard-cli`, and the
+Windows installer puts `switchboard-cli.exe` next to the app and can add it to the `PATH`.
 
 ## How it fits together
 
@@ -25,7 +26,9 @@ contains `bin/switchboard-cli`).
   channel (Unix socket, or loopback TCP with a token on Windows) described in `control.json`.
 - When a Switchboard window opens while the daemon runs, the window takes over: the daemon stops
   its apps, hands their list over and exits, and the window starts them again. Quitting the window
-  stops its apps, as before.
+  stops its apps and waits for them to exit, as before.
+- The supervisor records its processes in `running.json`. If it is killed without stopping them,
+  the next supervisor (window or daemon) stops the processes it left behind.
 - **Logs** are kept in memory by the supervisor (last 5000 lines per app). They disappear when the
   supervisor exits. The daemon exits after 30 minutes without any running app
   (`--idle-timeout`, `SWITCHBOARD_DAEMON_IDLE_TIMEOUT`, 0 = never).
@@ -86,7 +89,7 @@ exit and error codes. In short:
 | `name` | `--name` | required, unique (case-insensitive) |
 | `working_dir` | `--dir` | required, absolute (relative paths and `~` are resolved by the CLI); warning if missing |
 | `kind` | `--kind` | `cargo`, `npm`, `dotnet`, `maven`, `python`, `go`, `raw` |
-| `command` | `--command` | required for `npm` and `raw`, ignored for `cargo`, optional otherwise |
+| `command` | `--command` | required for `npm` and `raw`, ignored for `cargo`, optional otherwise; no unclosed quote |
 | `url` | `--url`, `--no-url` | `http(s)://…`; enables health checks |
 | `env_vars` | `--env K=V`, `--unset-env K`, `--clear-env` | keys without spaces or `=`, no duplicates |
 | `auto_restart` | `--auto-restart [true\|false]` | relaunch after a crash |
@@ -146,5 +149,7 @@ switchboard-cli import apps-backup.json --dry-run --json
   Run `switchboard-cli daemon stop` when you are done if you do not want the apps to keep running.
 - Env var values are printed in clear by `list`/`show` and written to `apps.json` (mode 0600).
   `export` leaves them out unless `--include-env` is given.
+- `command` is split like a shell: `--command '-c "import app; app.run()"'` keeps the quoted part
+  as one argument. `raw` commands go to `sh -c` unchanged.
 - Commands run from `working_dir` in a login, interactive shell (`$SHELL -i -l -c`; `cmd.exe /C` on
   Windows), like the native apps, so `cargo`, `npm`, `nvm`… are found as in a terminal.

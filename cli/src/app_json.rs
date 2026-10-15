@@ -60,9 +60,20 @@ pub fn launch_commands(app: &AppConfig) -> Vec<String> {
         .into_iter()
         .map(|spec| match app.kind {
             AppKind::Raw => spec.args.last().cloned().unwrap_or_default(),
-            _ => std::iter::once(spec.program).chain(spec.args).collect::<Vec<_>>().join(" "),
+            _ => std::iter::once(spec.program)
+                .chain(spec.args.iter().map(|a| display_word(a)))
+                .collect::<Vec<_>>()
+                .join(" "),
         })
         .collect()
+}
+
+/// Remet des guillemets autour d'un argument qui en avait besoin, pour un affichage relisible.
+fn display_word(word: &str) -> String {
+    if !word.is_empty() && !word.chars().any(|c| c.is_whitespace() || "'\"\\$`".contains(c)) {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 pub fn status_of(runtime: Option<&RuntimeState>) -> String {
@@ -377,6 +388,8 @@ mod tests {
         assert_eq!(launch_commands(&cargo), vec!["cargo build", "cargo run"]);
         let raw = AppConfig { kind: AppKind::Raw, command: "./run.sh --x".to_string(), ..Default::default() };
         assert_eq!(launch_commands(&raw), vec!["./run.sh --x"]);
+        let python = AppConfig { kind: AppKind::Python, command: r#"-c "print('hi')""#.to_string(), ..Default::default() };
+        assert_eq!(launch_commands(&python), vec![r#"python3 -c 'print('\''hi'\'')'"#]);
     }
 
     #[test]
