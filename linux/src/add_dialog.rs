@@ -1,17 +1,23 @@
 use adw::prelude::*;
 use gtk::glib;
-use switchboard_core::{AppDraft, AppKind, AppView};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use switchboard_core::{AppDraft, AppKind, AppView, DraftReport, FieldIssue};
 
 use crate::dialog_shell::dialog_shell;
+use crate::issue_text::issue_text;
 
 fn kind_to_index(kind: Option<AppKind>) -> u32 {
     AppKind::ALL.iter().position(|k| Some(*k) == kind).unwrap_or(0) as u32
 }
 
-/// `existing` preremplit les champs en mode edition ; `on_save` recoit le draft au clic "Enregistrer".
+/// `existing` preremplit les champs en mode edition ; `on_save` recoit le draft au clic "Enregistrer",
+/// une fois `validate` sans erreur (les avertissements demandent un second clic).
 pub fn show_app_dialog(
     parent: &impl IsA<gtk::Window>,
     existing: Option<&AppView>,
+    validate: impl Fn(&AppDraft) -> DraftReport + 'static,
     on_save: impl Fn(AppDraft) + 'static,
 ) {
     let title = if existing.is_some() { "Modifier l'app" } else { "Ajouter une app" };
@@ -106,7 +112,17 @@ pub fn show_app_dialog(
         .build();
     advanced_group.add(&env_scroller);
 
+    let errors_label = gtk::Label::builder().wrap(true).xalign(0.0).css_classes(vec!["error".to_string()]).build();
+    let warnings_label = gtk::Label::builder().wrap(true).xalign(0.0).css_classes(vec!["warning".to_string()]).build();
+    let issues_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    issues_box.append(&errors_label);
+    issues_box.append(&warnings_label);
+    let issues_group = adw::PreferencesGroup::new();
+    issues_group.add(&issues_box);
+    issues_group.set_visible(false);
+
     let page = adw::PreferencesPage::new();
+    page.add(&issues_group);
     page.add(&general_group);
     page.add(&exec_group);
     page.add(&advanced_group);
@@ -131,9 +147,11 @@ pub fn show_app_dialog(
             });
         });
     }
+    // Avertissements deja montres pour ce contenu : le clic suivant enregistre.
+    let warned = Rc::new(Cell::new(false));
     {
         let dialog = dialog.clone();
-        save_btn.connect_clicked(move |_| {
+        save_btn.connect_clicked(move |save_btn| {
             let env_vars = env_buffer
                 .text(&env_buffer.start_iter(), &env_buffer.end_iter(), false)
                 .lines()
@@ -156,10 +174,30 @@ pub fn show_app_dialog(
                 auto_restart: auto_restart_switch.is_active(),
                 start_order: start_order_spin.value() as i32,
             };
+            let report = validate(&draft);
+            let warnings: Vec<_> = report.warnings.iter().filter(|w| w.code != "ignored").collect();
+            errors_label.set_label(&bullet_list(report.errors.iter()));
+            errors_label.set_visible(!report.errors.is_empty());
+            warnings_label.set_label(&bullet_list(warnings.iter().copied()));
+            warnings_label.set_visible(!warnings.is_empty());
+            issues_group.set_visible(!report.errors.is_empty() || !warnings.is_empty());
+            if !report.errors.is_empty() {
+                warned.set(false);
+                return;
+            }
+            if !warnings.is_empty() && !warned.get() {
+                warned.set(true);
+                save_btn.set_label("Enregistrer quand même");
+                return;
+            }
             on_save(draft);
             dialog.close();
         });
     }
 
     dialog.present();
+}
+
+fn bullet_list<'a>(issues: impl Iterator<Item = &'a FieldIssue>) -> String {
+    issues.map(|issue| format!("• {}", issue_text(issue))).collect::<Vec<_>>().join("\n")
 }

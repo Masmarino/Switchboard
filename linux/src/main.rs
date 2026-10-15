@@ -2,6 +2,7 @@ mod about_dialog;
 mod add_dialog;
 mod config_export_dialog;
 mod dialog_shell;
+mod issue_text;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -358,7 +359,11 @@ impl Ui {
                 let this_weak = this_weak.clone();
                 // Read current data, not the stale snapshot from when this row was built.
                 let view_snapshot = current_view.borrow().clone();
-                add_dialog::show_app_dialog(&window, Some(&view_snapshot), move |draft| {
+                let validate = {
+                    let engine = engine.clone();
+                    move |draft: &switchboard_core::AppDraft| engine.borrow().validate(draft, Some(id))
+                };
+                add_dialog::show_app_dialog(&window, Some(&view_snapshot), validate, move |draft| {
                     engine.borrow_mut().update_app(id, draft);
                     this_weak();
                 });
@@ -429,7 +434,7 @@ fn build_ui(app: &adw::Application) {
     {
         let engine = engine.clone();
         app.connect_shutdown(move |_| {
-            engine.borrow_mut().stop_all_running();
+            engine.borrow_mut().shutdown(std::time::Duration::from_secs(3));
         });
     }
 
@@ -531,7 +536,11 @@ fn build_ui(app: &adw::Application) {
         add_btn.connect_clicked(move |_| {
             let engine = ui.engine.clone();
             let this_weak = ui.weak_refresh();
-            add_dialog::show_app_dialog(&window, None, move |draft| {
+            let validate = {
+                let engine = engine.clone();
+                move |draft: &switchboard_core::AppDraft| engine.borrow().validate(draft, None)
+            };
+            add_dialog::show_app_dialog(&window, None, validate, move |draft| {
                 engine.borrow_mut().add_app(draft);
                 this_weak();
             });
