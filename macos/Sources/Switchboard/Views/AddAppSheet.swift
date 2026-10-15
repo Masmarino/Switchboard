@@ -4,6 +4,7 @@ import AppKit
 struct AddAppSheet: View {
     @Environment(\.dismiss) private var dismiss
     let existing: AppEntry?
+    let validate: (AppDraftPayload) -> DraftValidation
     let onSave: (AppDraftPayload) -> Void
 
     @State private var name = ""
@@ -82,6 +83,8 @@ struct AddAppSheet: View {
                             }
                     }
                 }
+
+                issuesList
             }
             .padding(20)
 
@@ -95,12 +98,42 @@ struct AddAppSheet: View {
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(name.isEmpty || workingDir.isEmpty)
+                .disabled(!validation.isValid)
             }
             .padding(16)
         }
         .frame(width: 500)
         .onAppear { prefill() }
+    }
+
+    private var validation: DraftValidation {
+        validate(makeDraft())
+    }
+
+    /// Nom et dossier vides desactivent deja le bouton : inutile de le repeter en rouge.
+    private var visibleIssues: [(issue: FieldIssue, isError: Bool)] {
+        let current = validation
+        let errors = current.errors
+            .filter { !($0.code == "required" && ["name", "working_dir"].contains($0.field)) }
+            .map { (issue: $0, isError: true) }
+        let warnings = current.warnings
+            .filter { $0.code != "ignored" }
+            .map { (issue: $0, isError: false) }
+        return errors + warnings
+    }
+
+    @ViewBuilder
+    private var issuesList: some View {
+        let issues = visibleIssues
+        if !issues.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(issues, id: \.issue) { entry in
+                    Label(entry.issue.localizedMessage, systemImage: entry.isError ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(entry.isError ? Color.red : Color.orange)
+                        .font(.callout)
+                }
+            }
+        }
     }
 
     private var header: some View {

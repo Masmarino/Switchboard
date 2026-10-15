@@ -75,10 +75,12 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $state.addSheetPresented) {
-            AddAppSheet(existing: nil) { draft in state.addApp(draft) }
+            AddAppSheet(existing: nil, validate: { state.validate($0, editingID: nil) }) { draft in state.addApp(draft) }
         }
         .sheet(item: $state.editingApp) { app in
-            AddAppSheet(existing: app) { draft in state.updateApp(id: app.id, draft: draft) }
+            AddAppSheet(existing: app, validate: { state.validate($0, editingID: app.id) }) { draft in
+                state.updateApp(id: app.id, draft: draft)
+            }
         }
         .sheet(isPresented: $state.exportSheetPresented) {
             ConfigExportSheet(apps: state.apps) { ids, includeEnvVars in

@@ -55,6 +55,27 @@ final class DevtoolEngine {
         }
     }
 
+    /// Memes regles que le CLI ; `nil` si le moteur n'a pas pu lire le draft.
+    func validate(draft: AppDraftPayload, editingID: String?) -> DraftValidation? {
+        var result: DraftValidation?
+        withDraftJSON(draft) { json in
+            json.withCString { jsonPtr in
+                let raw = editingID.map { id in
+                    id.withCString { switchboard_engine_validate_draft_json(handle, $0, jsonPtr) }
+                } ?? switchboard_engine_validate_draft_json(handle, nil, jsonPtr)
+                guard let raw else { return }
+                defer { switchboard_string_free(raw) }
+                result = try? jsonDecoder.decode(DraftValidation.self, from: Data(String(cString: raw).utf8))
+            }
+        }
+        return result
+    }
+
+    /// Arrete les apps et attend leur fin, puis ferme le canal du CLI.
+    func shutdown() {
+        switchboard_engine_shutdown(handle)
+    }
+
     func removeApp(id: String) {
         withCStrings(id) { id in switchboard_engine_remove_app(handle, id) }
     }

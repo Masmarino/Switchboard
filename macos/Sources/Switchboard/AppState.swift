@@ -9,6 +9,9 @@ import UserNotifications
 final class AppState {
     private let engine = DevtoolEngine()
     private var pollTask: Task<Void, Never>?
+    /// Sans activite declaree, App Nap espace le poll quand la fenetre est cachee : les apps
+    /// supervisees et les requetes du CLI attendraient alors plusieurs secondes.
+    @ObservationIgnored private var appNapActivity: NSObjectProtocol?
     private var lastStatus: [String: String] = [:]
     private var lastSeenRevision: UInt64 = 0
     private var sinceSeq: UInt64 = 0
@@ -42,6 +45,10 @@ final class AppState {
 
     func start() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        appNapActivity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "Supervising dev processes and answering switchboard-cli"
+        )
         refresh(force: true)
         pollTask = Task {
             while !Task.isCancelled {
@@ -57,6 +64,9 @@ final class AppState {
 
     func stop() {
         pollTask?.cancel()
+        if let appNapActivity {
+            ProcessInfo.processInfo.endActivity(appNapActivity)
+        }
     }
 
     func refresh(force: Bool) {
@@ -125,9 +135,10 @@ final class AppState {
         refresh(force: true)
     }
 
-    /// deinit doesn't run on quit, so call this explicitly from the app delegate to avoid orphaned child processes.
+    /// deinit doesn't run on quit, so call this explicitly from the app delegate: waits for the
+    /// processes to exit (no orphans holding ports) and removes the CLI control files.
     func stopAllForShutdown() {
-        engine.stopAll()
+        engine.shutdown()
     }
 
     func clearLogs() {
@@ -153,6 +164,10 @@ final class AppState {
     func addApp(_ draft: AppDraftPayload) {
         engine.addApp(draft)
         refresh(force: true)
+    }
+
+    func validate(_ draft: AppDraftPayload, editingID: String?) -> DraftValidation {
+        engine.validate(draft: draft, editingID: editingID) ?? .empty
     }
 
     func updateApp(id: String, draft: AppDraftPayload) {
