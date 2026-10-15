@@ -92,6 +92,12 @@ pub struct RunningHandle {
     pub stop_requested: Arc<AtomicBool>,
 }
 
+impl Default for RunningHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunningHandle {
     pub fn new() -> Self {
         Self {
@@ -117,6 +123,19 @@ pub fn kill_process_group(pid: i32) {
         .output();
 }
 
+/// Dernier recours pour un process qui ignore SIGTERM.
+#[cfg(unix)]
+pub fn force_kill_process_group(pgid: i32) {
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+pub fn force_kill_process_group(pid: i32) {
+    kill_process_group(pid);
+}
+
 /// Simple-quote une valeur pour une commande shell (double les simple-quotes internes).
 #[cfg(unix)]
 fn shell_quote(value: &str) -> String {
@@ -126,6 +145,9 @@ fn shell_quote(value: &str) -> String {
 /// Les apps GUI macOS heritent d'un PATH minimal (pas de `~/.cargo/bin`, nvm, homebrew) —
 /// un shell de connexion interactif (`-i -l`) source `.zprofile`/`.zshrc` avant la commande,
 /// sinon `cargo`/`npm`/etc. echouent avec "No such file or directory" meme installes.
+/// `setsid` plutot que `setpgid` : sans terminal de controle, un shell `-i` lance depuis un
+/// terminal (frontend Linux, daemon au premier plan) ne peut pas etre suspendu par SIGTTOU.
+/// Le groupe cree a le meme id que le process, donc `kill(-pgid)` vise toujours tout l'arbre.
 #[cfg(unix)]
 fn spawn_process(
     spec: &CommandSpec,
@@ -145,11 +167,12 @@ fn spawn_process(
     cmd.args(["-i", "-l", "-c", &full_command])
         .current_dir(working_dir)
         .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     unsafe {
         cmd.pre_exec(|| {
-            libc::setpgid(0, 0);
+            libc::setsid();
             Ok(())
         });
     }
@@ -176,6 +199,7 @@ fn spawn_process(
     cmd.args(["/C", &full_command])
         .current_dir(working_dir)
         .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .creation_flags(CREATE_NEW_PROCESS_GROUP);

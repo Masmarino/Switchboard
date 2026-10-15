@@ -1,4 +1,7 @@
+use std::sync::mpsc;
 use uuid::Uuid;
+
+use crate::control::protocol::{ControlRequest, ControlResponse};
 use crate::process_manager::AppStatus;
 
 #[derive(Debug, Clone)]
@@ -7,6 +10,7 @@ pub enum Event {
     StatusChanged(Uuid, AppStatus),
     HealthChanged(Uuid, bool),
     StartRequested(Uuid),
+    Control(ControlRequest, mpsc::Sender<ControlResponse>),
 }
 
 pub fn stream_lines<R: std::io::Read>(reader: R, app_id: Uuid, tx: std::sync::mpsc::Sender<Event>) {

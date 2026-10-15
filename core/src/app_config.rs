@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+use crate::command_rule::CommandRule;
+use crate::config_file::ConfigFile;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AppKind {
     Cargo,
     Npm,
@@ -10,6 +13,7 @@ pub enum AppKind {
     Maven,
     Python,
     Go,
+    #[default]
     Raw,
 }
 
@@ -55,9 +59,26 @@ impl AppKind {
             _ => return None,
         })
     }
+
+    /// Accepte le format FFI (`cargo`) comme celui du fichier de config (`Cargo`).
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::from_ffi_str(&s.trim().to_ascii_lowercase())
+    }
+
+    /// Ce que le champ "Commande" signifie pour ce type (cf. `process_manager::build_commands`).
+    pub fn command_rule(self) -> CommandRule {
+        match self {
+            AppKind::Cargo => CommandRule::Ignored,
+            AppKind::Npm | AppKind::Raw => CommandRule::Required,
+            AppKind::Dotnet => CommandRule::Optional { default: None },
+            AppKind::Maven => CommandRule::Optional { default: Some("spring-boot:run") },
+            AppKind::Python => CommandRule::Optional { default: Some("main.py") },
+            AppKind::Go => CommandRule::Optional { default: Some(".") },
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub id: Uuid,
     pub name: String,
@@ -77,12 +98,6 @@ pub struct AppConfig {
     pub start_order: i32,
 }
 
-impl Default for AppKind {
-    fn default() -> Self {
-        Self::Raw
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ImportSummary {
     pub to_add: Vec<String>,
@@ -90,7 +105,7 @@ pub struct ImportSummary {
     pub invalid: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AppConfigList {
     pub apps: Vec<AppConfig>,
 }
@@ -167,32 +182,23 @@ impl AppConfigList {
     }
 
     pub fn config_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("com", "skolln", "switchboard")
-            .map(|dirs| dirs.config_dir().join("apps.json"))
+        crate::paths::config_dir().map(|dir| dir.join(crate::paths::CONFIG_FILE_NAME))
     }
 
-    /// Liste vide au premier lancement — pas de projet pre-rempli.
+    /// Liste vide au premier lancement — pas de projet pre-rempli. Un fichier illisible
+    /// donne aussi une liste vide : utiliser `ConfigFile::load` pour distinguer les cas.
     pub fn load_or_default() -> Self {
-        if let Some(path) = Self::config_path() {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(list) = Self::from_json(&contents) {
-                    return list;
-                }
-            }
-        }
-        Self::default()
+        ConfigFile::default_location().and_then(|file| file.load()).unwrap_or_default()
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::config_path()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no config dir available"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = self
-            .to_json()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        std::fs::write(path, json)
+        ConfigFile::default_location()
+            .and_then(|file| file.save(self))
+            .map_err(std::io::Error::other)
+    }
+
+    pub fn find(&self, id: Uuid) -> Option<&AppConfig> {
+        self.apps.iter().find(|a| a.id == id)
     }
 }
 
@@ -340,6 +346,22 @@ mod tests {
 
         assert_eq!(summary.invalid, 1);
         assert!(list.apps.is_empty());
+    }
+
+    #[test]
+    fn kind_parse_accepts_ffi_and_config_spellings() {
+        assert_eq!(AppKind::parse("npm"), Some(AppKind::Npm));
+        assert_eq!(AppKind::parse("Npm"), Some(AppKind::Npm));
+        assert_eq!(AppKind::parse(" DOTNET "), Some(AppKind::Dotnet));
+        assert_eq!(AppKind::parse("node"), None);
+    }
+
+    #[test]
+    fn every_kind_round_trips_through_its_ffi_string() {
+        for kind in AppKind::ALL {
+            assert_eq!(AppKind::parse(kind.ffi_str()), Some(kind));
+            assert_eq!(AppKind::parse(kind.display_name()), Some(kind));
+        }
     }
 
     #[test]

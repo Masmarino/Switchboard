@@ -1,9 +1,21 @@
 pub mod app_config;
+pub mod app_draft;
+pub mod command_rule;
+pub mod config_error;
+pub mod config_file;
+pub mod control;
 pub mod engine;
 pub mod health;
 pub mod log_stream;
+pub mod paths;
 pub mod process_manager;
+pub mod validation;
 
 pub use app_config::{AppConfig, AppConfigList, AppKind, ImportSummary};
-pub use engine::{AppDraft, AppView, Engine};
+pub use app_draft::AppDraft;
+pub use command_rule::CommandRule;
+pub use config_error::ConfigError;
+pub use config_file::ConfigFile;
+pub use engine::{AppView, DaemonStartError, Engine};
 pub use process_manager::AppStatus;
+pub use validation::{validate_draft, DraftReport, FieldIssue};

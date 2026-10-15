@@ -1,18 +1,32 @@
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::app_config::{AppConfig, AppConfigList, AppKind, ImportSummary};
+use crate::app_config::{AppConfigList, AppKind, ImportSummary};
+use crate::config_error::ConfigError;
+use crate::config_file::{ConfigFile, FileSignature};
+use crate::control::{ActionOutcome, ControlRequest, ControlServer, SupervisorClient, SupervisorRole};
 use crate::health::spawn_health_watcher;
 use crate::log_stream::Event;
-use crate::process_manager::{kill_process_group, run_app_thread, AppStatus, RunningHandle};
+use crate::process_manager::{force_kill_process_group, kill_process_group, run_app_thread, AppStatus, RunningHandle};
+
+pub use crate::app_draft::AppDraft;
+
+mod control_handler;
 
 const MAX_LOG_LINES: usize = 5000;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 const CPU_CHANGE_THRESHOLD: f32 = 0.5;
 const MEMORY_CHANGE_THRESHOLD_MB: f64 = 1.0;
+/// Frequence a laquelle on regarde si `apps.json` a ete modifie par un autre process (CLI).
+const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Delai laisse a un process apres SIGTERM avant SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+/// Le handover attend l'arret des process (SIGKILL compris) pour liberer leurs ports.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(20);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// Ignore le bruit de mesure sous le seuil pour eviter de bump la revision pour rien.
 fn resource_changed(old_cpu: f32, new_cpu: f32, old_mem: f64, new_mem: f64) -> bool {
@@ -54,6 +68,20 @@ impl AppRuntime {
         self.log_base_seq += self.logs.len() as u64;
         self.logs.clear();
     }
+
+    /// (lignes, sequence de la premiere, remplacement complet ?) pour un client a jour jusqu'a `since_seq`.
+    fn lines_since(&self, since_seq: u64) -> (Vec<String>, u64, bool) {
+        if since_seq >= self.log_base_seq {
+            let skip = (since_seq - self.log_base_seq) as usize;
+            (self.logs.iter().skip(skip).cloned().collect(), since_seq, false)
+        } else {
+            (self.logs.iter().cloned().collect(), self.log_base_seq, true)
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.log_base_seq + self.logs.len() as u64
+    }
 }
 
 /// Vue serialisable d'une app, consommee par chaque frontend (GTK direct, ou FFI JSON).
@@ -81,19 +109,6 @@ pub struct AppView {
     pub memory_mb: f64,
 }
 
-/// Champs editables d'une app, partages entre creation et modification.
-#[derive(Debug, Clone, Default)]
-pub struct AppDraft {
-    pub name: String,
-    pub working_dir: PathBuf,
-    pub kind: AppKind,
-    pub command: String,
-    pub url: Option<String>,
-    pub env_vars: Vec<(String, String)>,
-    pub auto_restart: bool,
-    pub start_order: i32,
-}
-
 fn status_label(status: &AppStatus) -> &'static str {
     match status {
         AppStatus::Stopped => "stopped",
@@ -117,21 +132,88 @@ pub struct Engine {
     visited_scratch: std::collections::HashSet<sysinfo::Pid>,
     last_sample: Option<Instant>,
     revision: u64,
-    /// Faux en tests : evite d'ecraser le fichier de config reel de l'utilisateur.
-    persist: bool,
+    /// `None` en tests : evite d'ecraser le fichier de config reel de l'utilisateur.
+    config_file: Option<ConfigFile>,
+    /// Derniere version du fichier connue, pour detecter les ecritures du CLI.
+    config_signature: Option<FileSignature>,
+    last_reload_check: Option<Instant>,
+    /// Apps a relancer des que leur process actuel s'est termine.
+    pending_restart: HashSet<Uuid>,
+    /// Apps mises en file par `start_all` dont le palier n'est pas encore atteint.
+    queued_starts: HashSet<Uuid>,
+    /// Echeance apres laquelle un arret demande passe a SIGKILL.
+    stop_deadlines: HashMap<Uuid, Instant>,
+    control: Option<ControlServer>,
+    control_in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    handover: Option<PendingHandover>,
+    shutdown_requested: bool,
+    shutting_down: bool,
+}
+
+struct PendingHandover {
+    reply: mpsc::Sender<crate::control::ControlResponse>,
+    ids: Vec<Uuid>,
+    deadline: Instant,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Engine {
+    /// Moteur d'une app native : config par defaut (ou `SWITCHBOARD_CONFIG_DIR`), et canal de
+    /// controle pour le CLI. Si le daemon du CLI tournait, il rend la main et ses apps sont relancees ici.
     pub fn new() -> Self {
-        Self::build(AppConfigList::load_or_default(), true)
+        match ConfigFile::default_location() {
+            Ok(file) => Self::supervising(file),
+            Err(_) => Self::build(None),
+        }
+    }
+
+    /// Comme `new`, sur un fichier donne : reprend la main sur le daemon s'il tourne et
+    /// ouvre le canal de controle du CLI.
+    pub fn supervising(file: ConfigFile) -> Self {
+        let mut engine = Self::build(Some(file));
+        engine.become_supervisor();
+        engine
+    }
+
+    /// Moteur sans canal de controle, sur un fichier donne.
+    pub fn with_config_file(file: ConfigFile) -> Self {
+        Self::build(Some(file))
+    }
+
+    /// Moteur du daemon headless. Refuse de demarrer si un superviseur (app native ou
+    /// autre daemon) repond deja pour ce dossier de config.
+    pub fn new_daemon(config_dir: &Path) -> Result<Self, DaemonStartError> {
+        if let Some(client) = SupervisorClient::discover(config_dir) {
+            return Err(DaemonStartError::AlreadySupervised { role: client.endpoint().role, pid: client.endpoint().pid });
+        }
+        let mut engine = Self::build(Some(ConfigFile::in_dir(config_dir)));
+        let server = ControlServer::start(config_dir, SupervisorRole::Daemon, engine.event_tx.clone())
+            .map_err(DaemonStartError::Io)?;
+        engine.control_in_flight = Some(server.in_flight());
+        engine.control = Some(server);
+        Ok(engine)
     }
 
     #[cfg(test)]
     fn new_ephemeral() -> Self {
-        Self::build(AppConfigList::default(), false)
+        Self::build(None)
     }
 
-    fn build(config: AppConfigList, persist: bool) -> Self {
+    fn build(config_file: Option<ConfigFile>) -> Self {
+        let config = match config_file.as_ref().map(ConfigFile::load) {
+            Some(Ok(list)) => list,
+            Some(Err(e)) => {
+                eprintln!("switchboard: {e} — starting with an empty list, the file is left untouched");
+                AppConfigList::default()
+            }
+            None => AppConfigList::default(),
+        };
+        let config_signature = config_file.as_ref().and_then(ConfigFile::signature);
         let mut runtimes = HashMap::new();
         for app in &config.apps {
             runtimes.insert(app.id, AppRuntime::new());
@@ -149,13 +231,125 @@ impl Engine {
             visited_scratch: std::collections::HashSet::new(),
             last_sample: None,
             revision: 0,
-            persist,
+            config_file,
+            config_signature,
+            last_reload_check: Some(Instant::now()),
+            pending_restart: HashSet::new(),
+            queued_starts: HashSet::new(),
+            stop_deadlines: HashMap::new(),
+            control: None,
+            control_in_flight: None,
+            handover: None,
+            shutdown_requested: false,
+            shutting_down: false,
         }
     }
 
-    fn persist(&self) {
-        if self.persist {
-            let _ = self.config.save();
+    fn become_supervisor(&mut self) {
+        let Some(dir) = self.config_file.as_ref().map(|f| f.dir().to_path_buf()) else { return };
+        let mut resume = Vec::new();
+        if let Some(client) = SupervisorClient::discover(&dir) {
+            match client.endpoint().role {
+                SupervisorRole::Daemon => match client.request_as::<Vec<Uuid>>(&ControlRequest::Handover, HANDOVER_TIMEOUT) {
+                    Ok(ids) => resume = ids,
+                    Err(e) => {
+                        eprintln!("switchboard: the CLI daemon did not hand over ({e}); CLI control stays with it");
+                        return;
+                    }
+                },
+                SupervisorRole::App => {
+                    eprintln!("switchboard: another Switchboard window already answers the CLI");
+                    return;
+                }
+            }
+        }
+        match ControlServer::start(&dir, SupervisorRole::App, self.event_tx.clone()) {
+            Ok(server) => {
+                self.control_in_flight = Some(server.in_flight());
+                self.control = Some(server);
+            }
+            Err(e) => eprintln!("switchboard: CLI control channel unavailable: {e}"),
+        }
+        for id in resume {
+            self.start_app(id);
+        }
+    }
+
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_file.as_ref().map(ConfigFile::path)
+    }
+
+    /// Lit le fichier si son empreinte a change (au plus une fois par seconde, sauf `force`)
+    /// et reconcilie : apps supprimees arretees, nouvelles apps pretes a demarrer.
+    fn reload_config_if_changed(&mut self, force: bool) {
+        let Some(file) = &self.config_file else { return };
+        let now = Instant::now();
+        if !force && self.last_reload_check.is_some_and(|t| now.duration_since(t) < RELOAD_CHECK_INTERVAL) {
+            return;
+        }
+        self.last_reload_check = Some(now);
+        let signature = file.signature();
+        // Fichier supprime : on garde la config en memoire plutot que de tout arreter.
+        if signature.is_none() || signature == self.config_signature {
+            return;
+        }
+        self.config_signature = signature;
+        if let Ok(list) = file.load()
+            && list != self.config
+        {
+            self.apply_config(list);
+        }
+    }
+
+    fn apply_config(&mut self, list: AppConfigList) {
+        let removed: Vec<Uuid> =
+            self.config.apps.iter().map(|a| a.id).filter(|id| list.find(*id).is_none()).collect();
+        for id in removed {
+            self.forget_app(id);
+        }
+        for app in &list.apps {
+            self.runtimes.entry(app.id).or_insert_with(AppRuntime::new);
+        }
+        self.config = list;
+        self.revision += 1;
+    }
+
+    fn forget_app(&mut self, id: Uuid) {
+        self.pending_restart.remove(&id);
+        self.queued_starts.remove(&id);
+        self.stop_app(id);
+        self.runtimes.remove(&id);
+    }
+
+    /// Recharge, modifie et sauvegarde sous verrou : une ecriture du CLI entre la lecture
+    /// et la sauvegarde ne peut pas etre perdue.
+    fn mutate_config<T>(&mut self, mutate: impl FnOnce(&mut AppConfigList) -> T) -> T {
+        let Some(file) = self.config_file.clone() else { return mutate(&mut self.config) };
+        let lock = file.lock();
+        if let Err(e) = &lock {
+            eprintln!("switchboard: {e}");
+        }
+        self.reload_config_if_changed(true);
+        let result = mutate(&mut self.config);
+        self.persist(&file);
+        drop(lock);
+        self.revision += 1;
+        result
+    }
+
+    fn persist(&mut self, file: &ConfigFile) {
+        if let Err(ConfigError::Invalid { .. }) = file.load() {
+            match file.backup_invalid() {
+                Ok(backup) => eprintln!("switchboard: invalid config saved as {}", backup.display()),
+                Err(e) => {
+                    eprintln!("switchboard: not overwriting invalid config (backup failed: {e})");
+                    return;
+                }
+            }
+        }
+        match file.save(&self.config) {
+            Ok(()) => self.config_signature = file.signature(),
+            Err(e) => eprintln!("switchboard: could not save config: {e}"),
         }
     }
 
@@ -181,6 +375,10 @@ impl Engine {
                     }
                     if terminal {
                         self.handles.remove(&id);
+                        self.stop_deadlines.remove(&id);
+                        if self.pending_restart.remove(&id) && !self.shutting_down {
+                            self.start_app_now(id);
+                        }
                     }
                 }
                 Event::HealthChanged(id, healthy) => {
@@ -189,10 +387,12 @@ impl Engine {
                     }
                 }
                 Event::StartRequested(id) => {
-                    if !self.handles.contains_key(&id) {
+                    let queued = self.queued_starts.remove(&id);
+                    if queued && !self.handles.contains_key(&id) && !self.shutting_down {
                         self.start_app_now(id);
                     }
                 }
+                Event::Control(request, reply) => self.handle_control(request, reply),
             }
         }
         if processed {
@@ -201,8 +401,39 @@ impl Engine {
     }
 
     fn poll(&mut self) {
+        self.reload_config_if_changed(false);
         self.drain_events();
+        self.enforce_stop_deadlines();
+        self.finish_handover_if_ready();
         self.sample_resource_usage();
+    }
+
+    /// Pour une boucle sans UI (daemon) : traite evenements, rechargements et requetes du CLI.
+    pub fn tick(&mut self) {
+        self.poll();
+    }
+
+    pub fn has_active_apps(&self) -> bool {
+        !self.handles.is_empty()
+    }
+
+    /// Le daemon doit se terminer (requete `shutdown` ou `handover` du CLI / d'une app native).
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    fn enforce_stop_deadlines(&mut self) {
+        if self.stop_deadlines.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let expired: Vec<Uuid> = self.stop_deadlines.iter().filter(|(_, d)| now >= **d).map(|(id, _)| *id).collect();
+        for id in expired {
+            self.stop_deadlines.remove(&id);
+            if let Some(pgid) = self.handles.get(&id).and_then(|h| *h.pgid.lock().unwrap()) {
+                force_kill_process_group(pgid);
+            }
+        }
     }
 
     /// Echantillonne CPU/memoire des process actifs, au plus une fois par seconde.
@@ -278,6 +509,10 @@ impl Engine {
 
     pub fn list_apps(&mut self, logs_for: Option<(Uuid, u64)>) -> Vec<AppView> {
         self.poll();
+        self.views(logs_for)
+    }
+
+    fn views(&self, logs_for: Option<(Uuid, u64)>) -> Vec<AppView> {
         self.config
             .apps
             .iter()
@@ -289,20 +524,8 @@ impl Engine {
                     AppStatus::Failed(msg) => Some(msg.clone()),
                     _ => None,
                 };
-                let (logs, logs_base_seq, logs_replace) = match logs_for {
-                    Some((id, since_seq)) if id == app.id => {
-                        let rt_base = runtime.map(|r| r.log_base_seq).unwrap_or(0);
-                        if since_seq >= rt_base {
-                            let skip = (since_seq - rt_base) as usize;
-                            let delta: Vec<String> = runtime
-                                .map(|r| r.logs.iter().skip(skip).cloned().collect())
-                                .unwrap_or_default();
-                            (delta, since_seq, false)
-                        } else {
-                            let full: Vec<String> = runtime.map(|r| r.logs.iter().cloned().collect()).unwrap_or_default();
-                            (full, rt_base, true)
-                        }
-                    }
+                let (logs, logs_base_seq, logs_replace) = match (logs_for, runtime) {
+                    (Some((id, since_seq)), Some(rt)) if id == app.id => rt.lines_since(since_seq),
                     _ => (Vec::new(), 0, false),
                 };
                 AppView {
@@ -330,46 +553,22 @@ impl Engine {
     }
 
     pub fn add_app(&mut self, draft: AppDraft) -> Uuid {
-        let app = AppConfig {
-            id: Uuid::new_v4(),
-            name: draft.name,
-            working_dir: draft.working_dir,
-            command: draft.command,
-            kind: draft.kind,
-            url: draft.url,
-            env_vars: draft.env_vars,
-            auto_restart: draft.auto_restart,
-            start_order: draft.start_order,
-        };
+        let app = draft.into_config(Uuid::new_v4());
         let id = app.id;
         self.runtimes.insert(id, AppRuntime::new());
-        self.config.add(app);
-        self.persist();
+        self.mutate_config(|config| config.add(app));
         id
     }
 
     pub fn update_app(&mut self, id: Uuid, draft: AppDraft) {
-        self.config.update(id, |app| {
-            app.name = draft.name;
-            app.working_dir = draft.working_dir;
-            app.command = draft.command;
-            app.kind = draft.kind;
-            app.url = draft.url;
-            app.env_vars = draft.env_vars;
-            app.auto_restart = draft.auto_restart;
-            app.start_order = draft.start_order;
+        self.mutate_config(|config| {
+            config.update(id, |app| *app = draft.into_config(id));
         });
-        self.persist();
     }
 
     pub fn remove_app(&mut self, id: Uuid) {
-        if self.handles.contains_key(&id) {
-            self.stop_app(id);
-        }
-        self.config.remove(id);
-        self.runtimes.remove(&id);
-        self.handles.remove(&id);
-        self.persist();
+        self.mutate_config(|config| config.remove(id));
+        self.forget_app(id);
     }
 
     /// Exporte un sous-ensemble d'apps en JSON, pret a etre ecrit dans un fichier.
@@ -386,17 +585,17 @@ impl Engine {
     /// Applique la fusion et persiste. Les apps remplacees gardent leur runtime existant.
     pub fn apply_import(&mut self, json: &str) -> Option<ImportSummary> {
         let incoming = AppConfigList::from_json(json).ok()?;
-        let summary = self.config.merge_import(incoming);
+        let summary = self.mutate_config(|config| config.merge_import(incoming));
         for app in &self.config.apps {
             self.runtimes.entry(app.id).or_insert_with(AppRuntime::new);
         }
-        self.persist();
         Some(summary)
     }
 
     pub fn clear_logs(&mut self, id: Uuid) {
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.clear_logs();
+            self.revision += 1;
         }
     }
 
@@ -409,22 +608,33 @@ impl Engine {
         std::fs::write(path, content)
     }
 
-    pub fn start_app(&mut self, id: Uuid) {
-        self.start_app_now(id);
+    /// Sans effet si l'app tourne deja (evite deux instances qui se disputent un port).
+    pub fn start_app(&mut self, id: Uuid) -> ActionOutcome {
+        if self.config.find(id).is_none() {
+            return ActionOutcome::NotFound;
+        }
+        if self.handles.contains_key(&id) {
+            return ActionOutcome::AlreadyRunning;
+        }
+        self.start_app_now(id)
     }
 
-    fn start_app_now(&mut self, id: Uuid) {
-        let Some(config) = self.config.apps.iter().find(|a| a.id == id).cloned() else {
-            return;
+    fn start_app_now(&mut self, id: Uuid) -> ActionOutcome {
+        let Some(config) = self.config.find(id).cloned() else {
+            return ActionOutcome::NotFound;
         };
+        self.revision += 1;
         if !config.working_dir.is_dir() {
             if let Some(rt) = self.runtimes.get_mut(&id) {
-                rt.status = AppStatus::Failed(format!(
-                    "dossier introuvable: {}",
-                    config.working_dir.display()
-                ));
+                rt.status = AppStatus::Failed(format!("dossier introuvable: {}", config.working_dir.display()));
             }
-            return;
+            return ActionOutcome::Failed;
+        }
+        // Statut immediat (avant le premier evenement du thread) : un `wait` ou un rafraichissement
+        // juste apres le demarrage ne doit pas voir l'echec du lancement precedent.
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.status = if config.kind == AppKind::Cargo { AppStatus::Building } else { AppStatus::Running };
+            rt.healthy = None;
         }
         let handle = RunningHandle::new();
         let pgid_slot = handle.pgid.clone();
@@ -437,33 +647,57 @@ impl Engine {
         std::thread::spawn(move || {
             run_app_thread(config, pgid_slot, stop_requested, tx);
         });
+        ActionOutcome::Started
     }
 
-    pub fn stop_app(&mut self, id: Uuid) {
-        if let Some(handle) = self.handles.get(&id) {
-            handle.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Some(pgid) = *handle.pgid.lock().unwrap() {
-                kill_process_group(pgid);
-            }
+    /// SIGTERM au groupe de process, puis SIGKILL s'il tourne encore apres `STOP_GRACE`.
+    pub fn stop_app(&mut self, id: Uuid) -> ActionOutcome {
+        self.pending_restart.remove(&id);
+        self.queued_starts.remove(&id);
+        let Some(handle) = self.handles.get(&id) else {
+            return if self.config.find(id).is_some() { ActionOutcome::NotRunning } else { ActionOutcome::NotFound };
+        };
+        handle.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(pgid) = *handle.pgid.lock().unwrap() {
+            kill_process_group(pgid);
         }
+        self.stop_deadlines.entry(id).or_insert_with(|| Instant::now() + STOP_GRACE);
+        ActionOutcome::Stopping
+    }
+
+    /// Arrete puis relance avec la config courante (une modification n'est prise en compte
+    /// qu'au prochain demarrage).
+    pub fn restart_app(&mut self, id: Uuid) -> ActionOutcome {
+        if self.config.find(id).is_none() {
+            return ActionOutcome::NotFound;
+        }
+        if !self.handles.contains_key(&id) {
+            return self.start_app(id);
+        }
+        self.stop_app(id);
+        self.pending_restart.insert(id);
+        ActionOutcome::Restarting
     }
 
     /// Demarre par paliers de `start_order` croissant, chacun attendant le precedent.
     /// Non-bloquant : tourne sur son propre thread, qui pousse des `Event::StartRequested`
-    /// que seul `drain_events` consomme.
-    pub fn start_all(&mut self) {
-        let mut tiers: Vec<(i32, Uuid)> =
-            self.config.apps.iter().map(|a| (a.start_order, a.id)).collect();
+    /// que seul `drain_events` consomme. Retourne les apps mises en file.
+    pub fn start_all(&mut self) -> Vec<Uuid> {
+        let mut tiers: Vec<(i32, Uuid)> = self
+            .config
+            .apps
+            .iter()
+            .filter(|a| !self.handles.contains_key(&a.id))
+            .map(|a| (a.start_order, a.id))
+            .collect();
         tiers.sort_by_key(|(order, _)| *order);
+        let queued: Vec<Uuid> = tiers.iter().map(|(_, id)| *id).collect();
+        self.queued_starts.extend(queued.iter().copied());
 
-        let already_running: std::collections::HashSet<Uuid> = self.handles.keys().copied().collect();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let mut current_order: Option<i32> = None;
             for (order, id) in tiers {
-                if already_running.contains(&id) {
-                    continue;
-                }
                 if current_order.is_some_and(|prev| prev != order) {
                     std::thread::sleep(Duration::from_millis(400));
                 }
@@ -473,12 +707,41 @@ impl Engine {
                 }
             }
         });
+        queued
     }
 
-    pub fn stop_all_running(&mut self) {
+    pub fn stop_all_running(&mut self) -> Vec<Uuid> {
         let ids: Vec<Uuid> = self.handles.keys().copied().collect();
-        for id in ids {
-            self.stop_app(id);
+        for id in &ids {
+            self.stop_app(*id);
+        }
+        ids
+    }
+
+    /// Arrete tout et attend la fin des process (SIGKILL au-dela de `grace`), pour ne pas
+    /// laisser d'orphelins qui gardent leurs ports.
+    pub fn shutdown(&mut self, grace: Duration) {
+        self.shutting_down = true;
+        self.control = None;
+        self.stop_all_running();
+        let deadline = Instant::now() + grace;
+        while !self.handles.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            self.drain_events();
+        }
+        for handle in self.handles.values() {
+            if let Some(pgid) = *handle.pgid.lock().unwrap() {
+                force_kill_process_group(pgid);
+            }
+        }
+        // Repond "shutting_down" aux requetes en attente, puis laisse les reponses deja
+        // envoyees (shutdown, handover) s'ecrire avant que le process ne se termine.
+        self.drain_events();
+        if let Some(in_flight) = &self.control_in_flight {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -489,17 +752,36 @@ impl Engine {
     }
 }
 
+#[derive(Debug)]
+pub enum DaemonStartError {
+    AlreadySupervised { role: SupervisorRole, pid: u32 },
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for DaemonStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonStartError::AlreadySupervised { role, pid } => {
+                write!(f, "apps are already supervised by the {} (pid {pid})", role.as_str())
+            }
+            DaemonStartError::Io(e) => write!(f, "cannot open the control channel: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DaemonStartError {}
+
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.stop_all_running();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        self.shutdown(SHUTDOWN_GRACE);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use crate::app_config::AppConfig;
+    use std::path::{Path, PathBuf};
 
     fn temp_engine() -> Engine {
         Engine::new_ephemeral()
@@ -860,23 +1142,260 @@ mod tests {
     }
 
     #[test]
-    fn sub_threshold_cpu_drift_does_not_bump_revision() {
-        let mut engine = temp_engine();
-        let id = engine.add_app(base_draft());
-        engine.handles.insert(id, RunningHandle::new());
-        engine.runtimes.get_mut(&id).unwrap().cpu_percent = 10.0;
-        engine.runtimes.get_mut(&id).unwrap().memory_mb = 50.0;
-
-        // Constants checked directly; behavior is covered by resource_changed's own tests.
-        assert!(CPU_CHANGE_THRESHOLD > 0.0);
-        assert!(MEMORY_CHANGE_THRESHOLD_MB > 0.0);
-    }
-
-    #[test]
     fn resource_change_detection_respects_thresholds() {
         assert!(!resource_changed(10.0, 10.3, 50.0, 50.5)); // both sub-threshold
         assert!(resource_changed(10.0, 10.6, 50.0, 50.5));  // cpu over threshold
         assert!(resource_changed(10.0, 10.3, 50.0, 51.5));  // memory over threshold
         assert!(!resource_changed(10.0, 10.0, 50.0, 50.0));  // no change at all
     }
+    fn file_engine() -> (tempfile::TempDir, ConfigFile, Engine) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = ConfigFile::in_dir(dir.path());
+        let engine = Engine::with_config_file(file.clone());
+        (dir, file, engine)
+    }
+
+    /// Les mtime de certains systemes de fichiers ont une resolution grossiere : on force
+    /// une empreinte differente en changeant aussi la taille.
+    fn external_write(file: &ConfigFile, list: &AppConfigList) {
+        file.update(|on_disk| {
+            *on_disk = list.clone();
+            Ok::<_, ConfigError>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn engine_persists_mutations_to_its_config_file() {
+        let (_dir, file, mut engine) = file_engine();
+        let id = engine.add_app(AppDraft { name: "Api".to_string(), ..base_draft() });
+        assert_eq!(file.load().unwrap().find(id).map(|a| a.name.as_str()), Some("Api"));
+        engine.remove_app(id);
+        assert!(file.load().unwrap().apps.is_empty());
+    }
+
+    #[test]
+    fn engine_picks_up_apps_added_by_another_process() {
+        let (_dir, file, mut engine) = file_engine();
+        let before = engine.revision();
+        let mut list = AppConfigList::default();
+        list.add(AppConfig { name: "From CLI".to_string(), working_dir: PathBuf::from("/tmp"), ..Default::default() });
+        external_write(&file, &list);
+
+        engine.reload_config_if_changed(true);
+        let apps = engine.list_apps(None);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "From CLI");
+        assert!(engine.revision() > before, "a reload must bump the revision so frontends refresh");
+    }
+
+    #[test]
+    fn engine_reload_drops_apps_removed_by_another_process() {
+        let (_dir, file, mut engine) = file_engine();
+        let id = engine.add_app(base_draft());
+        engine.handles.insert(id, RunningHandle::new());
+
+        external_write(&file, &AppConfigList::default());
+        engine.reload_config_if_changed(true);
+
+        assert!(engine.list_apps(None).is_empty());
+        assert!(!engine.runtimes.contains_key(&id));
+        assert!(engine.handles[&id].stop_requested.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn engine_mutation_does_not_lose_a_concurrent_external_edit() {
+        let (_dir, file, mut engine) = file_engine();
+        engine.add_app(AppDraft { name: "First".to_string(), ..base_draft() });
+        let mut on_disk = file.load().unwrap();
+        on_disk.add(AppConfig { name: "Added by CLI".to_string(), ..Default::default() });
+        external_write(&file, &on_disk);
+
+        // No poll in between: the mutation itself must reload before saving.
+        engine.add_app(AppDraft { name: "Second".to_string(), ..base_draft() });
+
+        let names: Vec<_> = file.load().unwrap().apps.into_iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["First", "Added by CLI", "Second"]);
+    }
+
+    #[test]
+    fn engine_keeps_a_broken_file_until_it_must_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = ConfigFile::in_dir(dir.path());
+        std::fs::write(file.path(), "{ typo").unwrap();
+        let mut engine = Engine::with_config_file(file.clone());
+        assert!(engine.list_apps(None).is_empty());
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "{ typo");
+
+        engine.add_app(base_draft());
+        assert_eq!(file.load().unwrap().apps.len(), 1);
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".json.invalid-"))
+            .count();
+        assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn start_app_refuses_a_second_instance() {
+        let mut engine = temp_engine();
+        let id = engine.add_app(base_draft());
+        engine.handles.insert(id, RunningHandle::new());
+        assert_eq!(engine.start_app(id), ActionOutcome::AlreadyRunning);
+    }
+
+    #[test]
+    fn start_app_reports_unknown_ids_and_missing_dirs() {
+        let mut engine = temp_engine();
+        assert_eq!(engine.start_app(Uuid::new_v4()), ActionOutcome::NotFound);
+        let id = engine.add_app(AppDraft { working_dir: PathBuf::from("/nonexistent-dir-42"), ..base_draft() });
+        assert_eq!(engine.start_app(id), ActionOutcome::Failed);
+        assert_eq!(engine.list_apps(None)[0].status_label, "failed");
+    }
+
+    #[test]
+    fn stop_app_reports_not_running() {
+        let mut engine = temp_engine();
+        let id = engine.add_app(base_draft());
+        assert_eq!(engine.stop_app(id), ActionOutcome::NotRunning);
+        assert_eq!(engine.stop_app(Uuid::new_v4()), ActionOutcome::NotFound);
+    }
+
+    #[test]
+    fn restart_starts_again_once_the_old_process_has_stopped() {
+        let mut engine = temp_engine();
+        let id = engine.add_app(AppDraft { working_dir: PathBuf::from("/nonexistent-dir-43"), ..base_draft() });
+        engine.handles.insert(id, RunningHandle::new());
+
+        assert_eq!(engine.restart_app(id), ActionOutcome::Restarting);
+        assert!(engine.handles.contains_key(&id), "old process still running until its exit event");
+
+        engine.event_tx.send(Event::StatusChanged(id, AppStatus::Stopped)).unwrap();
+        engine.drain_events();
+        // The relaunch ran (and failed on the missing directory) as soon as the stop landed.
+        assert_eq!(engine.list_apps(None)[0].status_label, "failed");
+    }
+
+    #[test]
+    fn stop_cancels_a_pending_restart() {
+        let mut engine = temp_engine();
+        let id = engine.add_app(AppDraft { working_dir: PathBuf::from("/nonexistent-dir-44"), ..base_draft() });
+        engine.handles.insert(id, RunningHandle::new());
+        engine.restart_app(id);
+        engine.stop_app(id);
+        engine.event_tx.send(Event::StatusChanged(id, AppStatus::Stopped)).unwrap();
+        engine.drain_events();
+        assert_eq!(engine.list_apps(None)[0].status_label, "stopped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_ignoring_sigterm_is_killed_after_the_grace_period() {
+        let mut engine = temp_engine();
+        let id = engine.add_app(AppDraft {
+            command: "trap '' TERM; echo ready; while true; do sleep 1; done".to_string(),
+            ..base_draft()
+        });
+        assert_eq!(engine.start_app(id), ActionOutcome::Started);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let view = engine.list_apps(Some((id, 0))).remove(0);
+            if view.logs.iter().any(|l| l == "ready") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        engine.stop_app(id);
+        // Pretend the grace period is over instead of waiting for it.
+        engine.stop_deadlines.insert(id, Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.has_active_apps() && Instant::now() < deadline {
+            engine.tick();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!engine.has_active_apps(), "SIGKILL escalation must end a process that traps SIGTERM");
+    }
+
+    #[test]
+    fn control_requests_round_trip_through_a_daemon_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new_daemon(dir.path()).expect("daemon engine");
+        let id = engine.add_app(base_draft());
+        let (done_tx, done_rx) = mpsc::channel();
+        let client_dir = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let client = SupervisorClient::discover(&client_dir).expect("supervisor discovered");
+            let status: Vec<crate::control::RuntimeState> =
+                client.request_as(&ControlRequest::Status, Duration::from_secs(5)).expect("status");
+            let logs: crate::control::LogChunk =
+                client.request_as(&ControlRequest::Logs { id, since: 0 }, Duration::from_secs(5)).expect("logs");
+            let unknown = client.request(&ControlRequest::Logs { id: Uuid::nil(), since: 0 }, Duration::from_secs(5));
+            done_tx.send((client.endpoint().role, status, logs, unknown.is_err())).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            engine.tick();
+            if let Ok(result) = done_rx.try_recv() {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "control round trip timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (role, status, logs, unknown_failed) = result;
+        assert_eq!(role, SupervisorRole::Daemon);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].id, id);
+        assert_eq!(status[0].status, "stopped");
+        assert_eq!(logs.next_seq, 0);
+        assert!(unknown_failed);
+    }
+
+    #[test]
+    fn a_second_daemon_is_refused_and_the_endpoint_is_cleaned_up_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Engine::new_daemon(dir.path()).expect("first daemon");
+        // The second daemon pings the first one, which only answers from its own loop.
+        let ticker_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || Engine::new_daemon(&ticker_dir).map(|_| ()));
+        let mut first = first;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() {
+            first.tick();
+            assert!(Instant::now() < deadline, "second daemon never got an answer");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(handle.join().unwrap(), Err(DaemonStartError::AlreadySupervised { .. })));
+
+        drop(first);
+        assert!(crate::control::Endpoint::read(dir.path()).is_none());
+        assert!(SupervisorClient::discover(dir.path()).is_none());
+    }
+    #[test]
+    fn a_native_app_takes_over_from_the_daemon_and_relaunches_its_apps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = Engine::new_daemon(dir.path()).expect("daemon engine");
+        let id = daemon.add_app(AppDraft { command: "while true; do sleep 1; done".to_string(), ..base_draft() });
+        assert_eq!(daemon.start_app(id), ActionOutcome::Started);
+        let daemon_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !daemon.shutdown_requested() && Instant::now() < deadline {
+                daemon.tick();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let still_running = daemon.has_active_apps();
+            daemon.shutdown(Duration::from_secs(2));
+            still_running
+        });
+
+        let mut app = Engine::supervising(ConfigFile::in_dir(dir.path()));
+
+        assert!(!daemon_thread.join().unwrap(), "the daemon must stop its processes before handing over");
+        assert!(app.has_active_apps(), "the app relaunches what the daemon was running");
+        let endpoint = crate::control::Endpoint::read(dir.path()).expect("the app publishes its endpoint");
+        assert_eq!(endpoint.role, SupervisorRole::App);
+        assert_eq!(endpoint.pid, std::process::id());
+        app.shutdown(Duration::from_secs(2));
+    }
 }
+
+
