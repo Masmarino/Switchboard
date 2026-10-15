@@ -15,6 +15,8 @@ public sealed class DevtoolEngine : IDisposable
     [DllImport(Dll)] private static extern ulong switchboard_engine_revision(IntPtr engine);
     [DllImport(Dll)] private static extern void switchboard_engine_add_app_json(IntPtr engine, string draftJson);
     [DllImport(Dll)] private static extern void switchboard_engine_update_app_json(IntPtr engine, string id, string draftJson);
+    [DllImport(Dll)] private static extern IntPtr switchboard_engine_validate_draft_json(IntPtr engine, string? editingId, string draftJson);
+    [DllImport(Dll)] private static extern void switchboard_engine_shutdown(IntPtr engine);
     [DllImport(Dll)] private static extern void switchboard_engine_remove_app(IntPtr engine, string id);
     [DllImport(Dll)] private static extern void switchboard_engine_start_app(IntPtr engine, string id);
     [DllImport(Dll)] private static extern void switchboard_engine_stop_app(IntPtr engine, string id);
@@ -47,6 +49,16 @@ public sealed class DevtoolEngine : IDisposable
 
     public void UpdateApp(string id, AppDraftPayload draft) =>
         switchboard_engine_update_app_json(_handle, id, JsonSerializer.Serialize(draft));
+
+    /// <summary>Memes regles que le CLI ; null si le moteur n'a pas pu lire le draft.</summary>
+    public DraftValidation? Validate(AppDraftPayload draft, string? editingId)
+    {
+        var json = ReadAndFreeString(switchboard_engine_validate_draft_json(_handle, editingId, JsonSerializer.Serialize(draft)));
+        return json is null ? null : JsonSerializer.Deserialize<DraftValidation>(json);
+    }
+
+    /// <summary>Arrete les apps et attend leur fin, puis ferme le canal du CLI.</summary>
+    public void Shutdown() => switchboard_engine_shutdown(_handle);
 
     public void RemoveApp(string id) => switchboard_engine_remove_app(_handle, id);
 

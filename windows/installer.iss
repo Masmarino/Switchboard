@@ -35,6 +35,9 @@ SolidCompression=yes
 ArchitecturesAllowed=x64
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
+; switchboard-cli.exe est installe a cote de l'app ; la tache "addtopath" rend {app} visible
+; aux terminaux ouverts apres l'installation.
+ChangesEnvironment=yes
 
 [Languages]
 Name: "french"; MessagesFile: "compiler:Languages\French.isl"
@@ -46,6 +49,10 @@ Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Tasks]
 Name: "desktopicon"; Description: "Créer un raccourci sur le Bureau"; GroupDescription: "Raccourcis supplémentaires:"
+Name: "addtopath"; Description: "Ajouter switchboard-cli au PATH"; GroupDescription: "Ligne de commande:"
+
+[Registry]
+Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: addtopath; Check: PathNeedsApp(ExpandConstant('{app}'))
 
 ; {group}/{userdesktop} se resolvent deja vers le profil de l'utilisateur reel
 ; meme sous installeur elevé (Inno Setup suit qui a lance l'installeur) — pas
@@ -69,6 +76,36 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; S
 Filename: "{app}\{#MyAppExeName}"; Description: "Lancer {#MyAppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
+const
+  EnvironmentKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
+
+function PathNeedsApp(Dir: string): Boolean;
+var
+  Path: string;
+begin
+  Result := True;
+  if RegQueryStringValue(HKLM, EnvironmentKey, 'Path', Path) then
+    Result := Pos(';' + Uppercase(Dir) + ';', ';' + Uppercase(Path) + ';') = 0;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Path, Dir: string;
+  P: Integer;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    exit;
+  if not RegQueryStringValue(HKLM, EnvironmentKey, 'Path', Path) then
+    exit;
+  Dir := ExpandConstant('{app}');
+  P := Pos(';' + Uppercase(Dir), Uppercase(Path));
+  if P > 0 then
+  begin
+    Delete(Path, P, Length(Dir) + 1);
+    RegWriteExpandStringValue(HKLM, EnvironmentKey, 'Path', Path);
+  end;
+end;
+
 function VCRedistNeedsInstall: Boolean;
 var
   Installed: Cardinal;

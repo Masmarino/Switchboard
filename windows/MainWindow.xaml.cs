@@ -64,7 +64,8 @@ public sealed partial class MainWindow : Window
         _timer.Start();
 
         // .NET finalizers aren't reliable at process exit — stop child processes explicitly.
-        Closed += (_, _) => { _engine.StopAll(); _trayIcon?.Dispose(); };
+        // Shutdown waits for the processes to exit (no orphans holding ports) and closes the CLI channel.
+        Closed += (_, _) => { _engine.Shutdown(); _trayIcon?.Dispose(); };
 
         RefreshNow();
     }
@@ -775,8 +776,13 @@ public sealed partial class MainWindow : Window
         headerPanel.Children.Add(headerIcon);
         headerPanel.Children.Add(headerTextPanel);
 
+        var errorsText = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Colors.Firebrick), Visibility = Visibility.Collapsed };
+        var warningsText = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Colors.DarkOrange), Visibility = Visibility.Collapsed };
+
         var panel = new StackPanel { Spacing = 20 };
         panel.Children.Add(headerPanel);
+        panel.Children.Add(errorsText);
+        panel.Children.Add(warningsText);
         panel.Children.Add(generalCard);
         panel.Children.Add(execCard);
         panel.Children.Add(advancedCard);
@@ -790,22 +796,44 @@ public sealed partial class MainWindow : Window
             XamlRoot = Content.XamlRoot,
         };
 
+        AppDraftPayload BuildDraft() => new()
+        {
+            Name = nameBox.Text.Trim(),
+            WorkingDir = dirBox.Text.Trim(),
+            Kind = KindOptions[Math.Max(0, kindCombo.SelectedIndex)].Kind.ToFfiValue(),
+            Command = commandBox.Text.Trim(),
+            Url = string.IsNullOrWhiteSpace(urlBox.Text) ? null : urlBox.Text.Trim(),
+            EnvVars = AppEntry.ParseEnvVarsText(envVarsBox.Text),
+            AutoRestart = autoRestartToggle.IsOn,
+            StartOrder = double.IsNaN(startOrderBox.Value) ? 0 : (int)startOrderBox.Value,
+        };
+
+        // Errors keep the dialog open; warnings need a second click to save anyway.
+        var warned = false;
+        dialog.PrimaryButtonClick += (_, args) =>
+        {
+            var report = _engine.Validate(BuildDraft(), existing?.Id) ?? new DraftValidation();
+            var warnings = report.Warnings.Where(w => w.Code != "ignored").ToList();
+            errorsText.Text = string.Join("\n", report.Errors.Select(e => $"• {e.LocalizedMessage}"));
+            errorsText.Visibility = report.Errors.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            warningsText.Text = string.Join("\n", warnings.Select(w => $"• {w.LocalizedMessage}"));
+            warningsText.Visibility = warnings.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (report.Errors.Count > 0)
+            {
+                warned = false;
+                args.Cancel = true;
+            }
+            else if (warnings.Count > 0 && !warned)
+            {
+                warned = true;
+                dialog.PrimaryButtonText = "Enregistrer quand même";
+                args.Cancel = true;
+            }
+        };
+
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
-            var kind = KindOptions[Math.Max(0, kindCombo.SelectedIndex)].Kind.ToFfiValue();
-            var envVars = AppEntry.ParseEnvVarsText(envVarsBox.Text);
-
-            var draft = new AppDraftPayload
-            {
-                Name = nameBox.Text.Trim(),
-                WorkingDir = dirBox.Text.Trim(),
-                Kind = kind,
-                Command = commandBox.Text.Trim(),
-                Url = string.IsNullOrWhiteSpace(urlBox.Text) ? null : urlBox.Text.Trim(),
-                EnvVars = envVars,
-                AutoRestart = autoRestartToggle.IsOn,
-                StartOrder = double.IsNaN(startOrderBox.Value) ? 0 : (int)startOrderBox.Value,
-            };
+            var draft = BuildDraft();
 
             if (existing is not null)
             {
