@@ -80,16 +80,13 @@ fn load_styles() {
 }
 
 fn show_message(parent: &impl IsA<gtk::Window>, text: &str, secondary: &str) {
-    let dialog = gtk::MessageDialog::builder()
-        .transient_for(parent)
+    gtk::AlertDialog::builder()
         .modal(true)
-        .message_type(gtk::MessageType::Info)
-        .buttons(gtk::ButtonsType::Ok)
-        .text(text)
-        .secondary_text(secondary)
-        .build();
-    dialog.connect_response(|dialog, _| dialog.close());
-    dialog.present();
+        .message(text)
+        .detail(secondary)
+        .buttons(["OK"])
+        .build()
+        .show(Some(parent));
 }
 
 struct Ui {
@@ -126,27 +123,27 @@ impl Ui {
 
         // Set when render_logs can patch the buffer incrementally instead of a full rebuild.
         let mut incremental_append: Option<(usize, Vec<String>)> = None;
-        if let Some(id) = selected {
-            if let Some(view) = apps.iter().find(|a| a.id == id) {
-                if view.logs_replace {
-                    *self.selected_logs.borrow_mut() = view.logs.clone();
-                } else if !view.logs.is_empty() {
-                    let mut logs = self.selected_logs.borrow_mut();
-                    // Buffer still shows the placeholder if it was empty — needs a full render.
-                    let was_empty = logs.is_empty();
-                    logs.extend(view.logs.iter().cloned());
-                    let overflow = logs.len().saturating_sub(MAX_DISPLAYED_LOG_LINES);
-                    if overflow > 0 {
-                        logs.drain(0..overflow);
-                    }
-                    if !was_empty {
-                        let survive = view.logs.len().min(logs.len());
-                        let appended = logs[logs.len() - survive..].to_vec();
-                        incremental_append = Some((overflow, appended));
-                    }
+        if let Some(id) = selected
+            && let Some(view) = apps.iter().find(|a| a.id == id)
+        {
+            if view.logs_replace {
+                *self.selected_logs.borrow_mut() = view.logs.clone();
+            } else if !view.logs.is_empty() {
+                let mut logs = self.selected_logs.borrow_mut();
+                // Buffer still shows the placeholder if it was empty — needs a full render.
+                let was_empty = logs.is_empty();
+                logs.extend(view.logs.iter().cloned());
+                let overflow = logs.len().saturating_sub(MAX_DISPLAYED_LOG_LINES);
+                if overflow > 0 {
+                    logs.drain(0..overflow);
                 }
-                self.since_seq.set(view.logs_base_seq + view.logs.len() as u64);
+                if !was_empty {
+                    let survive = view.logs.len().min(logs.len());
+                    let appended = logs[logs.len() - survive..].to_vec();
+                    incremental_append = Some((overflow, appended));
+                }
             }
+            self.since_seq.set(view.logs_base_seq + view.logs.len() as u64);
         }
 
         let mut selected_view: Option<AppView> = None;
@@ -181,15 +178,15 @@ impl Ui {
             *self.last_row_order.borrow_mut() = current_order;
         }
 
-        if selected_view.is_none() {
-            if let Some(first) = apps.first() {
-                // Fresh fallback selection: reset log state, or a stale since_seq from
-                // the old app corrupts the new app's log diff on the next refresh.
-                *self.selected.borrow_mut() = Some(first.id);
-                self.since_seq.set(0);
-                self.selected_logs.borrow_mut().clear();
-                selected_view = Some(first.clone());
-            }
+        if selected_view.is_none()
+            && let Some(first) = apps.first()
+        {
+            // Fresh fallback selection: reset log state, or a stale since_seq from
+            // the old app corrupts the new app's log diff on the next refresh.
+            *self.selected.borrow_mut() = Some(first.id);
+            self.since_seq.set(0);
+            self.selected_logs.borrow_mut().clear();
+            selected_view = Some(first.clone());
         }
 
         if let Some(view) = selected_view {
@@ -213,22 +210,21 @@ impl Ui {
         let filter = self.search_entry.text().to_string().to_lowercase();
         let buffer = self.log_view.buffer();
 
-        if filter.is_empty() {
-            if let Some((trimmed, new_lines)) = incremental {
-                if !new_lines.is_empty() {
-                    // Delete the trimmed lines, insert the new ones — avoids a full set_text.
-                    if trimmed > 0 {
-                        if let Some(mut cut) = buffer.iter_at_line(trimmed as i32) {
-                            buffer.delete(&mut buffer.start_iter(), &mut cut);
-                        }
-                    }
-                    let chunk = format!("\n{}", new_lines.join("\n"));
-                    buffer.insert(&mut buffer.end_iter(), &chunk);
-                    let mut end = buffer.end_iter();
-                    self.log_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
-                    return;
-                }
+        if filter.is_empty()
+            && let Some((trimmed, new_lines)) = incremental
+            && !new_lines.is_empty()
+        {
+            // Delete the trimmed lines, insert the new ones — avoids a full set_text.
+            if trimmed > 0
+                && let Some(mut cut) = buffer.iter_at_line(trimmed as i32)
+            {
+                buffer.delete(&mut buffer.start_iter(), &mut cut);
             }
+            let chunk = format!("\n{}", new_lines.join("\n"));
+            buffer.insert(&mut buffer.end_iter(), &chunk);
+            let mut end = buffer.end_iter();
+            self.log_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+            return;
         }
 
         let logs = self.selected_logs.borrow();
@@ -589,25 +585,18 @@ fn build_ui(app: &adw::Application) {
                         preview.to_replace.join(", ")
                     ));
                 }
-                let confirm = gtk::MessageDialog::builder()
-                    .transient_for(&window)
+                let confirm = gtk::AlertDialog::builder()
                     .modal(true)
-                    .message_type(gtk::MessageType::Question)
-                    .text("Importer cette configuration ?")
-                    .secondary_text(&detail)
+                    .message("Importer cette configuration ?")
+                    .detail(&detail)
+                    .buttons(["Annuler", "Importer"])
+                    .cancel_button(0)
+                    .default_button(1)
                     .build();
-                confirm.add_button("Annuler", gtk::ResponseType::Cancel);
-                confirm.add_button("Importer", gtk::ResponseType::Accept);
-                confirm.set_default_response(gtk::ResponseType::Accept);
-                let ui = ui.clone();
-                confirm.connect_response(move |dialog, response| {
-                    if response == gtk::ResponseType::Accept {
-                        ui.engine.borrow_mut().apply_import(&contents);
-                        ui.refresh_now();
-                    }
-                    dialog.close();
-                });
-                confirm.present();
+                if confirm.choose_future(Some(&window)).await == Ok(1) {
+                    ui.engine.borrow_mut().apply_import(&contents);
+                    ui.refresh_now();
+                }
             });
         });
     }
@@ -652,10 +641,10 @@ fn build_ui(app: &adw::Application) {
             let engine = ui.engine.clone();
             let window = window.clone();
             glib::spawn_future_local(async move {
-                if let Ok(file) = dialog.save_future(Some(&window)).await {
-                    if let Some(path) = file.path() {
-                        let _ = engine.borrow().export_logs(id, &path);
-                    }
+                if let Ok(file) = dialog.save_future(Some(&window)).await
+                    && let Some(path) = file.path()
+                {
+                    let _ = engine.borrow().export_logs(id, &path);
                 }
             });
         });

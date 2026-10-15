@@ -51,10 +51,10 @@ pub fn show_export_dialog(
                 .build();
             let dialog = dialog.clone();
             glib::spawn_future_local(async move {
-                if let Ok(file) = file_dialog.save_future(Some(&dialog)).await {
-                    if let Some(path) = file.path() {
-                        let _ = std::fs::write(path, json);
-                    }
+                if let Ok(file) = file_dialog.save_future(Some(&dialog)).await
+                    && let Some(path) = file.path()
+                {
+                    let _ = std::fs::write(path, json);
                 }
                 dialog.close();
             });

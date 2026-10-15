@@ -123,10 +123,10 @@ pub fn show_app_dialog(
             let dir_entry = dir_entry.clone();
             let dialog = dialog.clone();
             glib::spawn_future_local(async move {
-                if let Ok(folder) = file_dialog.select_folder_future(Some(&dialog)).await {
-                    if let Some(path) = folder.path() {
-                        dir_entry.set_text(&path.to_string_lossy());
-                    }
+                if let Ok(folder) = file_dialog.select_folder_future(Some(&dialog)).await
+                    && let Some(path) = folder.path()
+                {
+                    dir_entry.set_text(&path.to_string_lossy());
                 }
             });
         });
