@@ -126,7 +126,7 @@ jobs:
           fi
       - name: Build FFI and CLI (release)
         run: cargo build -p switchboard-ffi -p switchboard-cli --release
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "10.0.x"
       - name: Publish WinUI3 app

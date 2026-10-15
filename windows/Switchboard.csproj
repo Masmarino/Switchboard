@@ -19,11 +19,11 @@
     <!-- Sans ceci, l'app exige que l'utilisateur installe le Windows App Runtime a part ;
          avec, il est copie dans le dossier de sortie, comme dotnet publish self-contained. -->
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
-    <Version>0.1.0</Version>
+    <Version>0.5.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
   </ItemGroup>
 
