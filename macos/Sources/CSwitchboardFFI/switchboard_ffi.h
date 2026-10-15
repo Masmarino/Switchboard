@@ -65,6 +65,29 @@ void switchboard_engine_update_app_json(struct Engine *engine,
                                         const char *draft_json);
 
 /**
+ * Valide un draft avec les memes regles que le CLI. Retourne
+ * `{"errors":[{field,code,message}],"warnings":[...]}` (listes vides si tout va bien),
+ * a liberer avec [`switchboard_string_free`]. `editing_id` (ou NULL) exclut l'app modifiee
+ * du controle d'unicite du nom.
+ *
+ * # Safety
+ * `engine` doit etre un pointeur valide. `draft_json` doit etre une chaine C valide ;
+ * `editing_id`, si non-NULL, aussi.
+ */
+char *switchboard_engine_validate_draft_json(struct Engine *engine,
+                                             const char *editing_id,
+                                             const char *draft_json);
+
+/**
+ * Arrete toutes les apps et attend leur fin (SIGKILL apres quelques secondes), puis ferme
+ * le canal du CLI. A appeler a la fermeture de l'app, avant [`switchboard_engine_free`].
+ *
+ * # Safety
+ * `engine` doit etre un pointeur valide.
+ */
+void switchboard_engine_shutdown(struct Engine *engine);
+
+/**
  * # Safety
  * `engine` doit etre un pointeur valide. `id` doit etre une chaine C valide (UUID).
  */

@@ -145,6 +145,40 @@ pub unsafe extern "C" fn switchboard_engine_update_app_json(
     }
 }
 
+/// Valide un draft avec les memes regles que le CLI. Retourne
+/// `{"errors":[{field,code,message}],"warnings":[...]}` (listes vides si tout va bien),
+/// a liberer avec [`switchboard_string_free`]. `editing_id` (ou NULL) exclut l'app modifiee
+/// du controle d'unicite du nom.
+///
+/// # Safety
+/// `engine` doit etre un pointeur valide. `draft_json` doit etre une chaine C valide ;
+/// `editing_id`, si non-NULL, aussi.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn switchboard_engine_validate_draft_json(
+    engine: *mut Engine,
+    editing_id: *const c_char,
+    draft_json: *const c_char,
+) -> *mut c_char {
+    let engine = unsafe { &*engine };
+    let editing = unsafe { parse_uuid_arg(editing_id) };
+    let report = match (unsafe { c_str_to_string(draft_json) }).map(|json| serde_json::from_str::<FfiAppDraft>(&json)) {
+        Some(Ok(draft)) => engine.validate(&draft.into(), editing),
+        _ => return std::ptr::null_mut(),
+    };
+    string_to_c(serde_json::to_string(&report).unwrap_or_else(|_| "{\"errors\":[],\"warnings\":[]}".to_string()))
+}
+
+/// Arrete toutes les apps et attend leur fin (SIGKILL apres quelques secondes), puis ferme
+/// le canal du CLI. A appeler a la fermeture de l'app, avant [`switchboard_engine_free`].
+///
+/// # Safety
+/// `engine` doit etre un pointeur valide.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn switchboard_engine_shutdown(engine: *mut Engine) {
+    let engine = unsafe { &mut *engine };
+    engine.shutdown(std::time::Duration::from_secs(3));
+}
+
 /// # Safety
 /// `engine` doit etre un pointeur valide. `id` doit etre une chaine C valide (UUID).
 #[unsafe(no_mangle)]
@@ -283,5 +317,33 @@ fn serialize_summary(summary: &ImportSummary) -> String {
 pub unsafe extern "C" fn switchboard_string_free(s: *mut c_char) {
     if !s.is_null() {
         drop(unsafe { CString::from_raw(s) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take_string(ptr: *mut c_char) -> String {
+        assert!(!ptr.is_null());
+        let text = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
+        unsafe { switchboard_string_free(ptr) };
+        text
+    }
+
+    #[test]
+    fn validate_draft_json_reports_field_errors() {
+        let dir = std::env::temp_dir().join(format!("sb-ffi-{}", Uuid::new_v4()));
+        let mut engine = Engine::with_config_file(switchboard_core::ConfigFile::in_dir(&dir));
+        let draft = CString::new(r#"{"name":"  ","working_dir":"relative","kind":"npm","command":""}"#).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&take_string(unsafe {
+            switchboard_engine_validate_draft_json(&mut engine, std::ptr::null(), draft.as_ptr())
+        }))
+        .unwrap();
+        let fields: Vec<&str> = report["errors"].as_array().unwrap().iter().map(|e| e["field"].as_str().unwrap()).collect();
+        assert_eq!(fields, vec!["name", "working_dir", "command"]);
+
+        let invalid_json = CString::new("not json").unwrap();
+        assert!(unsafe { switchboard_engine_validate_draft_json(&mut engine, std::ptr::null(), invalid_json.as_ptr()) }.is_null());
     }
 }
