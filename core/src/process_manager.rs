@@ -18,8 +18,84 @@ fn command_words_or(command: &str, defaults: &[&str]) -> Vec<String> {
     if command.trim().is_empty() {
         defaults.iter().map(|s| s.to_string()).collect()
     } else {
-        command.split_whitespace().map(String::from).collect()
+        split_command(command).words
     }
+}
+
+/// Resultat de [`split_command`] : `unbalanced` signale un guillemet jamais referme
+/// (le reste de la ligne est alors pris tel quel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitCommand {
+    pub words: Vec<String>,
+    pub unbalanced: bool,
+}
+
+/// Decoupe comme un shell POSIX (guillemets simples et doubles, antislash) : sans ca,
+/// `-c "import x"` etait coupe au milieu des guillemets.
+pub fn split_command(command: &str) -> SplitCommand {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut chars = command.chars().peekable();
+    let mut unbalanced = false;
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => current.push(c),
+                        None => {
+                            unbalanced = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.peek() {
+                            Some(&next) if matches!(next, '"' | '\\' | '$' | '`') => {
+                                current.push(next);
+                                chars.next();
+                            }
+                            _ => current.push('\\'),
+                        },
+                        Some(c) => current.push(c),
+                        None => {
+                            unbalanced = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                match chars.next() {
+                    Some(next) => current.push(next),
+                    None => current.push('\\'),
+                }
+            }
+            c => {
+                in_word = true;
+                current.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    SplitCommand { words, unbalanced }
 }
 
 pub fn build_commands(config: &AppConfig) -> Vec<CommandSpec> {
@@ -30,13 +106,13 @@ pub fn build_commands(config: &AppConfig) -> Vec<CommandSpec> {
         ],
         AppKind::Npm => vec![CommandSpec {
             program: "npm".to_string(),
-            args: config.command.split_whitespace().map(String::from).collect(),
+            args: split_command(&config.command).words,
         }],
         AppKind::Dotnet => vec![CommandSpec {
             program: "dotnet".to_string(),
             args: ["run".to_string()]
                 .into_iter()
-                .chain(config.command.split_whitespace().map(String::from))
+                .chain(split_command(&config.command).words)
                 .collect(),
         }],
         AppKind::Maven => vec![CommandSpec {
@@ -123,6 +199,21 @@ pub fn kill_process_group(pid: i32) {
         .output();
 }
 
+/// Shell utilise pour lancer les apps (Unix) : celui de l'utilisateur, zsh a defaut.
+#[cfg(unix)]
+pub fn login_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+}
+
+/// Un shell interactif ignore SIGTERM : tant qu'il charge encore `.zshrc` (nvm peut prendre
+/// plusieurs secondes), seul SIGHUP l'arrete avant qu'il ne lance la commande.
+#[cfg(unix)]
+pub fn hang_up(pid: i32) {
+    unsafe {
+        libc::kill(pid, libc::SIGHUP);
+    }
+}
+
 /// Dernier recours pour un process qui ignore SIGTERM.
 #[cfg(unix)]
 pub fn force_kill_process_group(pgid: i32) {
@@ -156,7 +247,7 @@ fn spawn_process(
 ) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = login_shell();
     let full_command = std::iter::once(spec.program.as_str())
         .chain(spec.args.iter().map(|s| s.as_str()))
         .map(shell_quote)
@@ -179,6 +270,15 @@ fn spawn_process(
     cmd.spawn()
 }
 
+/// Entoure de guillemets un argument qui contient un espace, pour que `cmd.exe /C` le garde entier.
+#[cfg(windows)]
+fn cmd_quote(value: &str) -> String {
+    if !value.is_empty() && !value.chars().any(|c| c.is_whitespace() || c == '"') {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
 /// `Command::new` ne sait pas executer les `.cmd`/`.bat` (npm.cmd, etc.) directement —
 /// `cmd.exe /C` resout le PATH lui-meme, .cmd/.bat compris.
 #[cfg(windows)]
@@ -192,6 +292,7 @@ fn spawn_process(
 
     let full_command = std::iter::once(spec.program.as_str())
         .chain(spec.args.iter().map(|s| s.as_str()))
+        .map(cmd_quote)
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -440,6 +541,22 @@ mod tests {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "./run.sh --flag".to_string()],
         }]);
+    }
+
+    #[test]
+    fn python_keeps_quoted_arguments_whole() {
+        let config = config_with(AppKind::Python, r#"-c "import time; time.sleep(1)" 'a b' c\ d"#);
+        let commands = build_commands(&config);
+        assert_eq!(commands[0].args, vec!["-c", "import time; time.sleep(1)", "a b", "c d"]);
+    }
+
+    #[test]
+    fn split_command_handles_escapes_and_reports_unbalanced_quotes() {
+        assert_eq!(split_command(r#"a "b \"c\" \$d" ''"#).words, vec!["a", r#"b "c" $d"#, ""]);
+        assert!(!split_command("run dev").unbalanced);
+        let broken = split_command(r#"run "dev"#);
+        assert!(broken.unbalanced);
+        assert_eq!(broken.words, vec!["run", "dev"]);
     }
 
     #[test]

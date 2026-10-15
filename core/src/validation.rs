@@ -1,9 +1,10 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::app_config::AppConfigList;
+use crate::app_config::{AppConfigList, AppKind};
 use crate::app_draft::AppDraft;
 use crate::command_rule::CommandRule;
+use crate::process_manager::split_command;
 
 /// Borne haute du selecteur "Ordre de demarrage" des formulaires natifs.
 pub const START_ORDER_MAX: i32 = 99;
@@ -78,6 +79,11 @@ pub fn validate_draft(draft: &AppDraft, existing: &AppConfigList, editing: Optio
             "ignored",
             format!("command is ignored for kind \"{}\"", draft.kind.ffi_str()),
         )),
+        CommandRule::Required | CommandRule::Optional { .. }
+            if draft.kind != AppKind::Raw && split_command(&draft.command).unbalanced =>
+        {
+            errors.push(FieldIssue::new("command", "unbalanced_quotes", "command has an unclosed quote"))
+        }
         _ => {}
     }
 
@@ -120,7 +126,7 @@ pub fn validate_draft(draft: &AppDraft, existing: &AppConfigList, editing: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_config::{AppConfig, AppKind};
+    use crate::app_config::AppConfig;
     use std::path::PathBuf;
 
     fn valid_draft() -> AppDraft {
@@ -191,6 +197,15 @@ mod tests {
         let report = validate_draft(&cargo, &AppConfigList::default(), None);
         assert!(report.is_valid());
         assert_eq!(report.warnings[0].code, "ignored");
+    }
+
+    #[test]
+    fn unclosed_quotes_are_rejected_except_for_raw_commands() {
+        let npm = AppDraft { command: r#"run "dev"#.to_string(), ..valid_draft() };
+        assert_eq!(codes(&validate_draft(&npm, &AppConfigList::default(), None)), vec![("command", "unbalanced_quotes")]);
+        // Raw commands go to `sh -c` untouched: the shell reports its own syntax errors.
+        let raw = AppDraft { kind: AppKind::Raw, command: r#"echo "hi"#.to_string(), ..valid_draft() };
+        assert!(validate_draft(&raw, &AppConfigList::default(), None).is_valid());
     }
 
     #[test]

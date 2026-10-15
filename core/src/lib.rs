@@ -9,6 +9,7 @@ pub mod health;
 pub mod log_stream;
 pub mod paths;
 pub mod process_manager;
+pub mod running_state;
 pub mod validation;
 
 pub use app_config::{AppConfig, AppConfigList, AppKind, ImportSummary};

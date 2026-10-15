@@ -11,6 +11,8 @@ use crate::control::{ActionOutcome, ControlRequest, ControlServer, SupervisorCli
 use crate::health::spawn_health_watcher;
 use crate::log_stream::Event;
 use crate::process_manager::{force_kill_process_group, kill_process_group, run_app_thread, AppStatus, RunningHandle};
+use crate::running_state::{RunningProcess, RunningState};
+use crate::validation::{validate_draft, DraftReport};
 
 pub use crate::app_draft::AppDraft;
 
@@ -145,6 +147,9 @@ pub struct Engine {
     stop_deadlines: HashMap<Uuid, Instant>,
     control: Option<ControlServer>,
     control_in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// Dossier ou publier `running.json` (superviseur officiel seulement).
+    running_state_dir: Option<std::path::PathBuf>,
+    last_running: Vec<(Uuid, i32)>,
     handover: Option<PendingHandover>,
     shutdown_requested: bool,
     shutting_down: bool,
@@ -196,6 +201,7 @@ impl Engine {
             .map_err(DaemonStartError::Io)?;
         engine.control_in_flight = Some(server.in_flight());
         engine.control = Some(server);
+        engine.adopt_running_state(config_dir);
         Ok(engine)
     }
 
@@ -239,6 +245,8 @@ impl Engine {
             stop_deadlines: HashMap::new(),
             control: None,
             control_in_flight: None,
+            running_state_dir: None,
+            last_running: Vec::new(),
             handover: None,
             shutdown_requested: false,
             shutting_down: false,
@@ -267,12 +275,89 @@ impl Engine {
             Ok(server) => {
                 self.control_in_flight = Some(server.in_flight());
                 self.control = Some(server);
+                self.adopt_running_state(&dir);
             }
             Err(e) => eprintln!("switchboard: CLI control channel unavailable: {e}"),
         }
         for id in resume {
             self.start_app(id);
         }
+    }
+
+    /// Arrete les process qu'un superviseur precedent, mort sans s'arreter proprement, a
+    /// laisses derriere lui, puis publie les notres au meme endroit.
+    fn adopt_running_state(&mut self, dir: &Path) {
+        if let Some(previous) = RunningState::read(dir)
+            && previous.supervisor_pid != std::process::id()
+            && !self.process_alive(previous.supervisor_pid as i32)
+        {
+            let orphans: Vec<i32> = previous
+                .processes
+                .iter()
+                .filter(|p| self.process_started_at(p.pid) == Some(p.started_at))
+                .map(|p| p.pid)
+                .collect();
+            if !orphans.is_empty() {
+                eprintln!("switchboard: stopping {} process(es) left by a crashed supervisor", orphans.len());
+                std::thread::spawn(move || {
+                    for &pgid in &orphans {
+                        kill_process_group(pgid);
+                        #[cfg(unix)]
+                        crate::process_manager::hang_up(pgid);
+                    }
+                    std::thread::sleep(STOP_GRACE);
+                    for &pgid in &orphans {
+                        force_kill_process_group(pgid);
+                    }
+                });
+            }
+        }
+        self.running_state_dir = Some(dir.to_path_buf());
+        self.last_running.clear();
+        let _ = RunningState { supervisor_pid: std::process::id(), processes: Vec::new() }.write(dir);
+    }
+
+    fn process_alive(&mut self, pid: i32) -> bool {
+        self.process_started_at(pid).is_some()
+    }
+
+    fn process_started_at(&mut self, pid: i32) -> Option<u64> {
+        let pid = sysinfo::Pid::from_u32(u32::try_from(pid).ok()?);
+        self.sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        self.sys.process(pid).map(|p| p.start_time())
+    }
+
+    /// Publie les groupes de process en cours quand ils changent (pid connu une fois lance).
+    fn sync_running_state(&mut self) {
+        let Some(dir) = self.running_state_dir.clone() else { return };
+        let mut running: Vec<(Uuid, i32)> =
+            self.handles.iter().filter_map(|(id, h)| h.pgid.lock().unwrap().map(|pgid| (*id, pgid))).collect();
+        running.sort();
+        if running == self.last_running {
+            return;
+        }
+        let processes = running
+            .iter()
+            .filter_map(|&(app_id, pid)| {
+                self.process_started_at(pid).map(|started_at| RunningProcess { app_id, pid, started_at })
+            })
+            .collect();
+        let state = RunningState { supervisor_pid: std::process::id(), processes };
+        if let Err(e) = state.write(&dir) {
+            eprintln!("switchboard: could not record running processes: {e}");
+        }
+        self.last_running = running;
+    }
+
+    /// Memes regles que le CLI, sur la config courante (draft normalise au passage).
+    pub fn validate(&self, draft: &AppDraft, editing: Option<Uuid>) -> DraftReport {
+        let mut draft = draft.clone();
+        draft.normalize();
+        validate_draft(&draft, &self.config, editing)
     }
 
     pub fn config_path(&self) -> Option<&Path> {
@@ -404,6 +489,7 @@ impl Engine {
         self.reload_config_if_changed(false);
         self.drain_events();
         self.enforce_stop_deadlines();
+        self.sync_running_state();
         self.finish_handover_if_ready();
         self.sample_resource_usage();
     }
@@ -658,11 +744,34 @@ impl Engine {
             return if self.config.find(id).is_some() { ActionOutcome::NotRunning } else { ActionOutcome::NotFound };
         };
         handle.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(pgid) = *handle.pgid.lock().unwrap() {
+        let pgid = *handle.pgid.lock().unwrap();
+        if let Some(pgid) = pgid {
             kill_process_group(pgid);
+            #[cfg(unix)]
+            if self.is_login_shell(pgid) {
+                crate::process_manager::hang_up(pgid);
+            }
         }
         self.stop_deadlines.entry(id).or_insert_with(|| Instant::now() + STOP_GRACE);
         ActionOutcome::Stopping
+    }
+
+    /// Le leader du groupe est-il encore le shell (qui charge son `.zshrc`) plutot que l'app ?
+    #[cfg(unix)]
+    fn is_login_shell(&mut self, pid: i32) -> bool {
+        let Ok(raw) = u32::try_from(pid) else { return false };
+        let pid = sysinfo::Pid::from_u32(raw);
+        self.sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
+        );
+        let shell = crate::process_manager::login_shell();
+        let shell_name = Path::new(&shell).file_name();
+        self.sys
+            .process(pid)
+            .and_then(|p| p.exe())
+            .is_some_and(|exe| shell_name.is_some() && exe.file_name() == shell_name)
     }
 
     /// Arrete puis relance avec la config courante (une modification n'est prise en compte
@@ -733,6 +842,10 @@ impl Engine {
             if let Some(pgid) = *handle.pgid.lock().unwrap() {
                 force_kill_process_group(pgid);
             }
+        }
+        // Tout a recu SIGKILL : plus rien a laisser en heritage au superviseur suivant.
+        if let Some(dir) = self.running_state_dir.take() {
+            let _ = RunningState { supervisor_pid: std::process::id(), processes: Vec::new() }.write(&dir);
         }
         // Repond "shutting_down" aux requetes en attente, puis laisse les reponses deja
         // envoyees (shutdown, handover) s'ecrire avant que le process ne se termine.
@@ -1396,6 +1509,84 @@ mod tests {
         assert_eq!(endpoint.pid, std::process::id());
         app.shutdown(Duration::from_secs(2));
     }
+    #[cfg(unix)]
+    #[test]
+    fn a_new_supervisor_stops_processes_left_by_a_crashed_one() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let mut orphan = std::process::Command::new("sleep");
+        orphan.arg("60");
+        unsafe {
+            orphan.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut orphan = orphan.spawn().unwrap();
+        let pid = orphan.id() as i32;
+        let mut probe = Engine::new_ephemeral();
+        let started_at = probe.process_started_at(pid).expect("orphan is running");
+        RunningState {
+            supervisor_pid: dead_pid,
+            processes: vec![
+                RunningProcess { app_id: Uuid::new_v4(), pid, started_at },
+                // Same pid, other start time: a recycled pid must be left alone.
+                RunningProcess { app_id: Uuid::new_v4(), pid, started_at: started_at + 1000 },
+            ],
+        }
+        .write(dir.path())
+        .unwrap();
+
+        let _daemon = Engine::new_daemon(dir.path()).expect("daemon engine");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = orphan.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = orphan.kill();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.is_some(), "the orphaned process group must be stopped");
+        assert_eq!(RunningState::read(dir.path()), None, "the new supervisor starts with a clean record");
+    }
+
+    #[test]
+    fn running_processes_are_recorded_for_the_next_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = Engine::new_daemon(dir.path()).expect("daemon engine");
+        let id = daemon.add_app(AppDraft { command: "while true; do sleep 1; done".to_string(), ..base_draft() });
+        daemon.start_app(id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let state = loop {
+            daemon.tick();
+            if let Some(state) = RunningState::read(dir.path()) {
+                break state;
+            }
+            assert!(Instant::now() < deadline, "running.json never written");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(state.supervisor_pid, std::process::id());
+        assert_eq!(state.processes[0].app_id, id);
+        daemon.shutdown(Duration::from_secs(3));
+        assert_eq!(RunningState::read(dir.path()), None);
+    }
+
+    #[test]
+    fn validate_uses_the_current_apps_for_name_uniqueness() {
+        let mut engine = temp_engine();
+        let id = engine.add_app(AppDraft { name: "Api".to_string(), command: "x".to_string(), ..base_draft() });
+        let duplicate = AppDraft { name: " api ".to_string(), command: "x".to_string(), ..base_draft() };
+        assert_eq!(engine.validate(&duplicate, None).errors[0].code, "duplicate");
+        assert!(engine.validate(&duplicate, Some(id)).is_valid());
+    }
 }
+
 
 
