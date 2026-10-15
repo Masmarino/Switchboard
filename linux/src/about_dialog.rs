@@ -37,7 +37,7 @@ pub fn show_about_dialog(parent: &impl IsA<gtk::Window>) {
 
     let name_label = gtk::Label::builder().label("Switchboard").css_classes(vec!["title-2".to_string()]).build();
     let version_label =
-        gtk::Label::builder().label("Version 0.1.0").css_classes(vec!["dim-label".to_string()]).build();
+        gtk::Label::builder().label("Version 0.5.0").css_classes(vec!["dim-label".to_string()]).build();
 
     let header_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     header_box.set_halign(gtk::Align::Center);

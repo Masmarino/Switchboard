@@ -46,7 +46,7 @@ struct AboutView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Switchboard")
                     .font(.system(size: 18, weight: .bold))
-                Text("Version 0.1.0")
+                Text("Version 0.5.0")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }

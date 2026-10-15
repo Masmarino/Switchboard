@@ -503,7 +503,7 @@ public sealed partial class MainWindow : Window
         }
         var headerTextPanel = new StackPanel { Spacing = 2 };
         headerTextPanel.Children.Add(new TextBlock { Text = "Switchboard", FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.Bold });
-        headerTextPanel.Children.Add(new TextBlock { Text = "Version 0.1.0", FontSize = 12, Opacity = 0.6 });
+        headerTextPanel.Children.Add(new TextBlock { Text = "Version 0.5.0", FontSize = 12, Opacity = 0.6 });
         headerPanel.Children.Add(headerTextPanel);
 
         var introText = new TextBlock
